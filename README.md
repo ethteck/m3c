@@ -1,3 +1,1 @@
 It begins...
-
-Note: The license of this project (MIT License) does not apply to the mips_to_c subrepo, which is licensed as GPL 3.0.
