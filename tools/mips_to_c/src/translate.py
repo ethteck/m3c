@@ -47,6 +47,7 @@ from .types import (
 )
 
 ASSOCIATIVE_OPS: Set[str] = {"+", "&&", "||", "&", "|", "^", "*"}
+COMPOUND_ASSIGNMENT_OPS: Set[str] = {"+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"}
 
 ARGUMENT_REGS: List[Register] = list(
     map(Register, ["a0", "a1", "a2", "a3", "f12", "f14"])
@@ -172,9 +173,8 @@ class Formatter:
 
 def as_type(expr: "Expression", type: Type, silent: bool) -> "Expression":
     if expr.type.unify(type):
-        if not silent and not isinstance(expr, Literal):
-            return Cast(expr=expr, reinterpret=True, silent=False, type=type)
-        return expr
+        if silent or isinstance(expr, Literal):
+            return expr
     return Cast(expr=expr, reinterpret=True, silent=False, type=type)
 
 
@@ -227,9 +227,10 @@ class StackInfo:
     is_leaf: bool = attr.ib(default=True)
     is_variadic: bool = attr.ib(default=False)
     uses_framepointer: bool = attr.ib(default=False)
-    local_vars_region_bottom: int = attr.ib(default=0)
+    subroutine_arg_top: int = attr.ib(default=0)
     return_addr_location: int = attr.ib(default=0)
     callee_save_reg_locations: Dict[Register, int] = attr.ib(factory=dict)
+    callee_save_reg_region: Tuple[int, int] = attr.ib(default=(0, 0))
     unique_type_map: Dict[Any, "Type"] = attr.ib(factory=dict)
     local_vars: List["LocalVar"] = attr.ib(factory=list)
     temp_vars: List["EvalOnceStmt"] = attr.ib(factory=list)
@@ -249,16 +250,12 @@ class StackInfo:
     def in_subroutine_arg_region(self, location: int) -> bool:
         if self.is_leaf:
             return False
-        subroutine_arg_top = self.return_addr_location
-        if self.callee_save_reg_locations:
-            subroutine_arg_top = min(
-                subroutine_arg_top, min(self.callee_save_reg_locations.values())
-            )
+        assert self.subroutine_arg_top is not None
+        return location < self.subroutine_arg_top
 
-        return location < subroutine_arg_top
-
-    def in_local_var_region(self, location: int) -> bool:
-        return self.local_vars_region_bottom <= location < self.allocated_stack_size
+    def in_callee_save_reg_region(self, location: int) -> bool:
+        lower_bound, upper_bound = self.callee_save_reg_region
+        return lower_bound <= location < upper_bound
 
     def location_above_stack(self, location: int) -> bool:
         return location >= self.allocated_stack_size
@@ -335,25 +332,28 @@ class StackInfo:
         return False
 
     def get_stack_var(self, location: int, *, store: bool) -> "Expression":
-        if self.in_local_var_region(location):
-            return LocalVar(location, type=self.unique_type_for("stack", location))
-        elif self.location_above_stack(location):
+        # See `get_stack_info` for explanation
+        if self.location_above_stack(location):
             ret, arg = self.get_argument(location - self.allocated_stack_size)
             if not store:
                 self.add_argument(arg)
             return ret
         elif self.in_subroutine_arg_region(location):
             return SubroutineArg(location, type=Type.any())
-        else:
+        elif self.in_callee_save_reg_region(location):
             # Some annoying bookkeeping instruction. To avoid
             # further special-casing, just return whatever - it won't matter.
             return LocalVar(location, type=Type.any())
+        else:
+            # Local variable
+            return LocalVar(location, type=self.unique_type_for("stack", location))
 
     def maybe_get_register_var(self, reg: Register) -> Optional["RegisterVar"]:
         return self.reg_vars.get(reg)
 
     def add_register_var(self, reg: Register) -> None:
-        self.reg_vars[reg] = RegisterVar(reg, Type.any())
+        type = Type.floatish() if reg.is_float() else Type.intptr()
+        self.reg_vars[reg] = RegisterVar(reg, type)
 
     def use_register_var(self, var: "RegisterVar") -> None:
         self.used_reg_vars.add(var.register)
@@ -369,15 +369,30 @@ class StackInfo:
         ent = self.rodata.values.get(sym.symbol_name)
         if ent and ent.is_string and ent.data and isinstance(ent.data[0], bytes):
             return StringLiteral(ent.data[0], type=Type.ptr(Type.s8()))
-        type = Type.ptr()
+        type = Type.ptr(sym.type)
         typemap = self.typemap
         if typemap:
             ctype = typemap.var_types.get(sym.symbol_name)
             if ctype:
-                type, is_ptr = ptr_type_from_ctype(ctype, typemap)
+                ctype_type, is_ptr = ptr_type_from_ctype(ctype, typemap)
                 if is_ptr:
-                    return as_type(sym, type, True)
+                    ctype_type.unify(type)
+                    return as_type(sym, ctype_type, True)
+                else:
+                    type = ctype_type
         return AddressOf(sym, type=type)
+
+    def get_struct_type_map(self) -> Dict["Expression", Dict[int, Type]]:
+        """Reorganize struct information in unique_type_map by var & offset"""
+        struct_type_map: Dict[Expression, Dict[int, Type]] = {}
+        for (category, key), type in self.unique_type_map.items():
+            if category != "struct":
+                continue
+            var, offset = key
+            if var not in struct_type_map:
+                struct_type_map[var] = {}
+            struct_type_map[var][offset] = type
+        return struct_type_map
 
     def __str__(self) -> str:
         return "\n".join(
@@ -385,7 +400,7 @@ class StackInfo:
                 f"Stack info for function {self.function.name}:",
                 f"Allocated stack size: {self.allocated_stack_size}",
                 f"Leaf? {self.is_leaf}",
-                f"Bottom of local vars region: {self.local_vars_region_bottom}",
+                f"Bounds of callee-saved vars region: {self.callee_save_reg_locations}",
                 f"Location of return addr: {self.return_addr_location}",
                 f"Locations of callee save registers: {self.callee_save_reg_locations}",
             ]
@@ -393,13 +408,26 @@ class StackInfo:
 
 
 def get_stack_info(
-    function: Function, rodata: Rodata, start_node: Node, typemap: Optional[TypeMap]
+    function: Function,
+    rodata: Rodata,
+    flow_graph: FlowGraph,
+    typemap: Optional[TypeMap],
 ) -> StackInfo:
     info = StackInfo(function, rodata, typemap)
 
     # The goal here is to pick out special instructions that provide information
     # about this function's stack setup.
-    for inst in start_node.block.instructions:
+    #
+    # IDO puts local variables *above* the saved registers on the stack, but
+    # GCC puts local variables *below* the saved registers.
+    # To support both, we explicitly determine both the upper & lower bounds of the
+    # saved registers. Then, we estimate the boundary of the subroutine arguments
+    # by finding the lowest stack offset that is loaded from or computed. (This
+    # assumes that the compiler will never reuse a section of stack for *both*
+    # a local variable *and* a subroutine argument.) Anything within the stack frame,
+    # but outside of these two regions, is considered a local variable.
+    callee_saved_offset_and_size: List[Tuple[int, int]] = []
+    for inst in flow_graph.entry_node().block.instructions:
         if not inst.args or not isinstance(inst.args[0], Register):
             continue
 
@@ -429,29 +457,87 @@ def get_stack_info(
         ):
             # Saving the return address on the stack.
             info.is_leaf = False
-            info.return_addr_location = inst.args[1].lhs_as_literal()
+            stack_offset = inst.args[1].lhs_as_literal()
+            info.return_addr_location = stack_offset
+            callee_saved_offset_and_size.append((stack_offset, 4))
         elif (
             inst.mnemonic in ["sw", "swc1", "sdc1"]
             and destination in SAVED_REGS
             and isinstance(inst.args[1], AsmAddressMode)
             and inst.args[1].rhs.register_name == "sp"
+            and destination not in info.callee_save_reg_locations
         ):
             # Initial saving of callee-save register onto the stack.
-            info.callee_save_reg_locations[destination] = inst.args[1].lhs_as_literal()
-
-    # Find the region that contains local variables. It is above saved registers
-    # and the return address, if those exist. If they don't, the local variables
-    # can lie directly at the bottom of the stack.
-    info.local_vars_region_bottom = 0
+            stack_offset = inst.args[1].lhs_as_literal()
+            info.callee_save_reg_locations[destination] = stack_offset
+            callee_saved_offset_and_size.append(
+                (stack_offset, 8 if inst.mnemonic == "sdc1" else 4)
+            )
 
     if not info.is_leaf:
-        info.local_vars_region_bottom = info.return_addr_location + 4
+        # Iterate over the whole function, not just the first basic block,
+        # to estimate the boundary for the subroutine argument region
+        info.subroutine_arg_top = info.allocated_stack_size
+        for node in flow_graph.nodes:
+            for inst in node.block.instructions:
+                if not inst.args or not isinstance(inst.args[0], Register):
+                    continue
+                destination = inst.args[0]
 
-    if info.callee_save_reg_locations:
-        info.local_vars_region_bottom = max(
-            info.local_vars_region_bottom,
-            max(info.callee_save_reg_locations.values()) + 4,
-        )
+                if (
+                    inst.mnemonic in ["lw", "lwc1", "ldc1"]
+                    and isinstance(inst.args[1], AsmAddressMode)
+                    and inst.args[1].rhs.register_name == "sp"
+                    and inst.args[1].lhs_as_literal() > 16
+                ):
+                    info.subroutine_arg_top = min(
+                        info.subroutine_arg_top, inst.args[1].lhs_as_literal()
+                    )
+                elif (
+                    inst.mnemonic == "addiu"
+                    and destination.register_name != "sp"
+                    and inst.args[1] == Register("sp")
+                    and isinstance(inst.args[2], AsmLiteral)
+                    and inst.args[2].value < info.allocated_stack_size
+                ):
+                    info.subroutine_arg_top = min(
+                        info.subroutine_arg_top, inst.args[2].value
+                    )
+
+        # Compute the bounds of the callee-saved register region, including padding
+        callee_saved_offset_and_size.sort()
+        bottom, last_size = callee_saved_offset_and_size[0]
+
+        # Both IDO & GCC save registers in two subregions:
+        # (a) One for double-sized registers
+        # (b) One for word-sized registers, padded to a multiple of 8 bytes
+        # IDO has (a) lower than (b); GCC has (b) lower than (a)
+        # Check that there are no gaps in this region, other than a single
+        # 4-byte word between subregions.
+        top = bottom
+        internal_padding_added = False
+        for offset, size in callee_saved_offset_and_size:
+            if offset != top:
+                if (
+                    not internal_padding_added
+                    and size != last_size
+                    and offset == top + 4
+                ):
+                    internal_padding_added = True
+                else:
+                    raise DecompFailure(
+                        f"Gap in callee-saved word stack region. "
+                        f"Saved: {callee_saved_offset_and_size}, "
+                        f"gap at: {offset} != {top}."
+                    )
+            top = offset + size
+            last_size = size
+        # Expand boundaries to multiples of 8 bytes
+        info.callee_save_reg_region = (bottom, top)
+
+        # Subroutine arguments must be at the very bottom of the stack, so they
+        # must come after the callee-saved region
+        info.subroutine_arg_top = min(info.subroutine_arg_top, bottom)
 
     return info
 
@@ -460,23 +546,24 @@ def format_hex(val: int) -> str:
     return format(val, "x").upper()
 
 
-def escape_char(ch: str) -> str:
+def escape_byte(b: int) -> bytes:
     table = {
-        "\0": "\\0",
-        "\b": "\\b",
-        "\f": "\\f",
-        "\n": "\\n",
-        "\r": "\\r",
-        "\t": "\\t",
-        "\v": "\\v",
-        "\\": "\\\\",
-        '"': '\\"',
+        b"\0": b"\\0",
+        b"\b": b"\\b",
+        b"\f": b"\\f",
+        b"\n": b"\\n",
+        b"\r": b"\\r",
+        b"\t": b"\\t",
+        b"\v": b"\\v",
+        b"\\": b"\\\\",
+        b'"': b'\\"',
     }
-    if ch in table:
-        return table[ch]
-    if ord(ch) < 0x20 or ord(ch) in [0xFF, 0x7F]:
-        return "\\x{:02x}".format(ord(ch))
-    return ch
+    bs = bytes([b])
+    if bs in table:
+        return table[bs]
+    if b < 0x20 or b in (0xFF, 0x7F):
+        return f"\\x{b:02x}".encode("ascii")
+    return bs
 
 
 @attr.s(eq=False)
@@ -823,6 +910,13 @@ class Cast(Expression):
             return True
         return False
 
+    def is_trivial(self) -> bool:
+        return (
+            self.reinterpret
+            and self.expr.type.is_float() == self.type.is_float()
+            and is_trivial_expression(self.expr)
+        )
+
     def format(self, fmt: Formatter) -> str:
         if self.reinterpret and self.expr.type.is_float() != self.type.is_float():
             # This shouldn't happen, but mark it in the output if it does.
@@ -1050,15 +1144,14 @@ class StringLiteral(Expression):
 
     def format(self, fmt: Formatter) -> str:
         has_trailing_null = False
-        strdata: str
-        try:
-            strdata = self.data.decode("utf-8")
-        except UnicodeDecodeError:
-            strdata = self.data.decode("latin1")
-        while strdata and strdata[-1] == "\0":
-            strdata = strdata[:-1]
+        data = self.data
+        while data and data[-1] == 0:
+            data = data[:-1]
             has_trailing_null = True
-        ret = '"' + "".join(map(escape_char, strdata)) + '"'
+        data = b"".join(map(escape_byte, data))
+
+        strdata = data.decode("utf-8", "backslashreplace")
+        ret = f'"{strdata}"'
         if not has_trailing_null:
             ret += " /* not null-terminated */"
         return ret
@@ -1268,8 +1361,7 @@ class SetPhiStmt(Statement):
         return True
 
     def format(self, fmt: Formatter) -> str:
-        val_str = format_expr(self.expr, fmt)
-        return f"{self.phi.propagates_to().get_var_name()} = {val_str};"
+        return format_assignment(self.phi.propagates_to(), self.expr, fmt)
 
 
 @attr.s
@@ -1292,13 +1384,14 @@ class StoreStmt(Statement):
         return True
 
     def format(self, fmt: Formatter) -> str:
+        dest = self.dest
         source = self.source
         if (
-            isinstance(self.dest, StructAccess) and self.dest.late_has_known_type()
-        ) or isinstance(self.dest, (ArrayAccess, LocalVar, RegisterVar, SubroutineArg)):
+            isinstance(dest, StructAccess) and dest.late_has_known_type()
+        ) or isinstance(dest, (ArrayAccess, LocalVar, RegisterVar, SubroutineArg)):
             # Known destination; fine to elide some casts.
             source = elide_casts_for_store(source)
-        return f"{self.dest.format(fmt)} = {format_expr(source, fmt)};"
+        return format_assignment(dest, source, fmt)
 
 
 @attr.s
@@ -1562,7 +1655,7 @@ def deref(
     var.type.unify(Type.ptr())
     stack_info.record_struct_access(var, offset)
     field_name: Optional[str] = None
-    type: Type = stack_info.unique_type_for("struct", (var, offset))
+    type: Type = stack_info.unique_type_for("struct", (uw_var, offset))
 
     # Struct access with type information.
     typemap = stack_info.typemap
@@ -1601,7 +1694,7 @@ def deref(
 
 def is_trivial_expression(expr: Expression) -> bool:
     # Determine whether an expression should be evaluated only once or not.
-    if expr is None or isinstance(
+    if isinstance(
         expr,
         (
             EvalOnceExpr,
@@ -1610,6 +1703,7 @@ def is_trivial_expression(expr: Expression) -> bool:
             GlobalSymbol,
             LocalVar,
             PassedInArg,
+            PhiExpr,
             RegisterVar,
             SubroutineArg,
         ),
@@ -1617,6 +1711,8 @@ def is_trivial_expression(expr: Expression) -> bool:
         return True
     if isinstance(expr, AddressOf):
         return is_trivial_expression(expr.expr)
+    if isinstance(expr, Cast):
+        return expr.is_trivial()
     return False
 
 
@@ -1698,6 +1794,21 @@ def format_expr(expr: Expression, fmt: Formatter) -> str:
     return ret
 
 
+def format_assignment(dest: Expression, source: Expression, fmt: Formatter) -> str:
+    """Stringify `dest = source;`."""
+    dest = late_unwrap(dest)
+    source = late_unwrap(source)
+    if isinstance(source, BinaryOp) and source.op in COMPOUND_ASSIGNMENT_OPS:
+        rhs = None
+        if late_unwrap(source.left) == dest:
+            rhs = source.right
+        elif late_unwrap(source.right) == dest and source.op in ASSOCIATIVE_OPS:
+            rhs = source.left
+        if rhs is not None:
+            return f"{dest.format(fmt)} {source.op}= {format_expr(rhs, fmt)};"
+    return f"{dest.format(fmt)} = {format_expr(source, fmt)};"
+
+
 def parenthesize_for_struct_access(expr: Expression, fmt: Formatter) -> str:
     # Nested dereferences may need to be parenthesized. All other
     # expressions will already have adequate parentheses added to them.
@@ -1714,7 +1825,7 @@ def elide_casts_for_store(expr: Expression) -> Expression:
         return elide_casts_for_store(uw_expr.expr)
     if isinstance(uw_expr, Literal) and uw_expr.type.is_int():
         return Literal(uw_expr.value, type=Type.intish())
-    return expr
+    return uw_expr
 
 
 def uses_expr(expr: Expression, expr_filter: Callable[[Expression], bool]) -> bool:
@@ -1834,6 +1945,13 @@ def load_upper(args: InstrArgs) -> Expression:
     source = stack_info.address_of_gsym(stack_info.global_symbol(sym))
     imm = Literal(offset)
     return handle_addi_real(args.reg_ref(0), None, source, imm, stack_info)
+
+
+def handle_convert(expr: Expression, dest_type: Type, source_type: Type) -> Cast:
+    # int <-> float casts should be explicit
+    silent = dest_type.kind != source_type.kind
+    expr.type.unify(source_type)
+    return Cast(expr=expr, type=dest_type, silent=silent, reinterpret=False)
 
 
 def handle_la(args: InstrArgs) -> Expression:
@@ -1985,7 +2103,7 @@ def handle_load(args: InstrArgs, type: Type) -> Expression:
     expr = deref(args.memory_ref(1), args.regs, args.stack_info, size=size)
 
     # Detect rodata constants
-    if isinstance(expr, StructAccess):
+    if isinstance(expr, StructAccess) and expr.offset == 0:
         target = early_unwrap(expr.struct_var)
         if (
             isinstance(target, AddressOf)
@@ -2059,8 +2177,11 @@ def make_store(args: InstrArgs, type: Type) -> Optional[StoreStmt]:
     size = type.get_size_bits() // 8
     stack_info = args.stack_info
     source_reg = args.reg_ref(0)
-    source_val = args.reg(0)
     source_raw = args.regs.get_raw(source_reg)
+    if type.is_float() and type.get_size_bits() == 64:
+        source_val = args.dreg(0)
+    else:
+        source_val = args.reg(0)
     target = args.memory_ref(1)
     is_stack = isinstance(target, AddressMode) and stack_info.is_stack_reg(target.rhs)
     if (
@@ -2279,7 +2400,7 @@ def array_access_from_add(
             target_size=None,
             field_name=sub_field_name,
             stack_info=stack_info,
-            type=Type.ptr(elem_type),
+            type=Type.cptr(elem_type, typemap),
         )
         offset -= sub_offset
         target_type = type_from_ctype(elem_type, typemap)
@@ -2632,6 +2753,7 @@ CASES_DESTINATION_FIRST: InstrMap = {
         UnaryOp(op="-", expr=as_s32(a.reg(1)), type=Type.s32())
     ),
     "div.fictive": lambda a: BinaryOp.s32(a.reg(1), "/", a.full_imm(2)),
+    "mod.fictive": lambda a: BinaryOp.s32(a.reg(1), "%", a.full_imm(2)),
     # 64-bit integer arithmetic, treated mostly the same as 32-bit for now
     "daddi": lambda a: handle_addi(a),
     "daddiu": lambda a: handle_addi(a),
@@ -2663,17 +2785,17 @@ CASES_DESTINATION_FIRST: InstrMap = {
     "div.d": lambda a: BinaryOp.f64(a.dreg(1), "/", a.dreg(2)),
     "mul.d": lambda a: BinaryOp.f64(a.dreg(1), "*", a.dreg(2)),
     # Floating point conversions
-    "cvt.d.s": lambda a: Cast(expr=as_f32(a.reg(1)), type=Type.f64()),
-    "cvt.d.w": lambda a: Cast(expr=as_intish(a.reg(1)), type=Type.f64()),
-    "cvt.s.d": lambda a: Cast(expr=as_f64(a.dreg(1)), type=Type.f32()),
-    "cvt.s.w": lambda a: Cast(expr=as_intish(a.reg(1)), type=Type.f32()),
-    "cvt.w.d": lambda a: Cast(expr=as_f64(a.dreg(1)), type=Type.s32()),
-    "cvt.w.s": lambda a: Cast(expr=as_f32(a.reg(1)), type=Type.s32()),
-    "cvt.s.u.fictive": lambda a: Cast(expr=as_u32(a.reg(1)), type=Type.f32()),
-    "cvt.u.d.fictive": lambda a: Cast(expr=as_f64(a.dreg(1)), type=Type.u32()),
-    "cvt.u.s.fictive": lambda a: Cast(expr=as_f32(a.reg(1)), type=Type.u32()),
-    "trunc.w.s": lambda a: Cast(expr=as_f32(a.reg(1)), type=Type.s32()),
-    "trunc.w.d": lambda a: Cast(expr=as_f64(a.dreg(1)), type=Type.s32()),
+    "cvt.d.s": lambda a: handle_convert(a.reg(1), Type.f64(), Type.f32()),
+    "cvt.d.w": lambda a: handle_convert(a.reg(1), Type.f64(), Type.intish()),
+    "cvt.s.d": lambda a: handle_convert(a.dreg(1), Type.f32(), Type.f64()),
+    "cvt.s.w": lambda a: handle_convert(a.reg(1), Type.f32(), Type.intish()),
+    "cvt.w.d": lambda a: handle_convert(a.dreg(1), Type.s32(), Type.f64()),
+    "cvt.w.s": lambda a: handle_convert(a.reg(1), Type.s32(), Type.f32()),
+    "cvt.s.u.fictive": lambda a: handle_convert(a.reg(1), Type.f32(), Type.u32()),
+    "cvt.u.d.fictive": lambda a: handle_convert(a.dreg(1), Type.u32(), Type.f64()),
+    "cvt.u.s.fictive": lambda a: handle_convert(a.reg(1), Type.u32(), Type.f32()),
+    "trunc.w.s": lambda a: handle_convert(a.reg(1), Type.s32(), Type.f32()),
+    "trunc.w.d": lambda a: handle_convert(a.dreg(1), Type.s32(), Type.f64()),
     # Bit arithmetic
     "ori": lambda a: handle_ori(a),
     "and": lambda a: BinaryOp.int(left=a.reg(1), op="&", right=a.reg(2)),
@@ -2745,7 +2867,7 @@ CASES_DESTINATION_FIRST: InstrMap = {
     "lbu": lambda a: handle_load(a, type=Type.u8()),
     "lh": lambda a: handle_load(a, type=Type.s16()),
     "lhu": lambda a: handle_load(a, type=Type.u16()),
-    "lw": lambda a: handle_load(a, type=Type.intptr32()),
+    "lw": lambda a: handle_load(a, type=Type.of_size(32)),
     "lwu": lambda a: handle_load(a, type=Type.u32()),
     "lwc1": lambda a: handle_load(a, type=Type.f32()),
     "ldc1": lambda a: handle_load(a, type=Type.f64()),
@@ -3508,6 +3630,20 @@ def translate_graph_from_block(
         )
 
 
+def resolve_types_late(stack_info: StackInfo) -> None:
+    """
+    After translating a function, perform a final type-resolution pass.
+    """
+    struct_type_map = stack_info.get_struct_type_map()
+    for var, offset_type_map in struct_type_map.items():
+        if len(offset_type_map) == 1 and 0 in offset_type_map:
+            # var was probably a plain pointer, not a struct
+            # Try to unify it with the appropriate pointer type,
+            # to fill in the type if it does not already have one
+            type = offset_type_map[0]
+            var.type.unify(Type.ptr(type))
+
+
 @attr.s
 class FunctionInfo:
     stack_info: StackInfo = attr.ib()
@@ -3525,8 +3661,7 @@ def translate_to_ast(
     """
     # Initialize info about the function.
     flow_graph: FlowGraph = build_flowgraph(function, rodata)
-    start_node = flow_graph.entry_node()
-    stack_info = get_stack_info(function, rodata, start_node, typemap)
+    stack_info = get_stack_info(function, rodata, flow_graph, typemap)
 
     initial_regs: Dict[Register, Expression] = {
         Register("sp"): GlobalSymbol("sp", type=Type.ptr()),
@@ -3565,8 +3700,8 @@ def translate_to_ast(
                 Register("a1"): make_arg(4, Type.any()),
                 Register("a2"): make_arg(8, Type.any()),
                 Register("a3"): make_arg(12, Type.any()),
-                Register("f12"): make_arg(0, Type.f32()),
-                Register("f14"): make_arg(4, Type.f32()),
+                Register("f12"): make_arg(0, Type.floatish()),
+                Register("f14"): make_arg(4, Type.floatish()),
             }
         )
 
@@ -3589,7 +3724,12 @@ def translate_to_ast(
     used_phis: List[PhiExpr] = []
     return_blocks: List[BlockInfo] = []
     translate_graph_from_block(
-        start_node, start_reg, stack_info, used_phis, return_blocks, options
+        flow_graph.entry_node(),
+        start_reg,
+        stack_info,
+        used_phis,
+        return_blocks,
+        options,
     )
 
     # We mark the function as having a return type if all return nodes have
@@ -3619,6 +3759,7 @@ def translate_to_ast(
             b.return_value = None
 
     assign_phis(used_phis, stack_info)
+    resolve_types_late(stack_info)
 
     if options.pdb_translate:
         import pdb

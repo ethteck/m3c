@@ -82,7 +82,8 @@ class Register:
     register_name: str = attr.ib()
 
     def is_float(self) -> bool:
-        return self.register_name[0] == "f" and self.register_name != "fp"
+        name = self.register_name
+        return bool(name) and name[0] == "f" and name != "fp"
 
     def other_f64_reg(self) -> "Register":
         assert (
@@ -491,7 +492,4 @@ def parse_instruction(line: str, meta: InstructionMeta) -> Instruction:
         instr = Instruction(mnemonic, args, meta)
         return normalize_instruction(instr)
     except Exception as e:
-        print(
-            f"Failed to parse instruction: {line}, {meta.loc_str()}\n", file=sys.stderr
-        )
-        raise e
+        raise DecompFailure(f"Failed to parse instruction {meta.loc_str()}: {line}")
