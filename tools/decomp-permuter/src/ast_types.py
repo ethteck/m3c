@@ -9,7 +9,6 @@ For the purposes of the randomizer these restrictions are acceptable."""
 
 from dataclasses import dataclass, field
 from typing import Union, Dict, Set, List
-import sys
 
 from pycparser import c_ast
 from pycparser.c_ast import ArrayDecl, TypeDecl, PtrDecl, FuncDecl, IdentifierType
@@ -31,7 +30,7 @@ class TypeMap:
 def basic_type(name: Union[str, List[str]]) -> TypeDecl:
     names = [name] if isinstance(name, str) else name
     idtype = IdentifierType(names=names)
-    return TypeDecl(declname=None, quals=[], type=idtype)
+    return TypeDecl(declname=None, quals=[], align=[], type=idtype)
 
 
 def pointer(type: Type) -> Type:

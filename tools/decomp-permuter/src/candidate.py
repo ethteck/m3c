@@ -1,33 +1,29 @@
 import copy
 from dataclasses import dataclass, field
 import functools
-import os
-from typing import List, Dict, Optional, Callable, Optional, Tuple, Iterable
+from typing import Optional, Tuple
 
 from pycparser import c_ast as ca
 
 from .compiler import Compiler
 from .randomizer import Randomizer
 from .scorer import Scorer
-from .perm.perm import EvalState, Perm
+from .perm.perm import EvalState
 from .perm.ast import apply_ast_perms
 from .helpers import try_remove
 from .profiler import Profiler
-from . import perm
 from . import ast_util
 
 
 @dataclass
 class CandidateResult:
-    """
-    Represents the result of scoring a candidate, and is sent from child to
-    parent processes.
-    """
+    """Represents the result of scoring a candidate, and is sent from child to
+    parent processes, or server to client with p@h."""
 
     score: int
-    hash: str
+    hash: Optional[str]
     source: Optional[str]
-    profiler: Profiler = field(default_factory=Profiler)
+    profiler: Optional[Profiler] = None
 
 
 @dataclass
@@ -53,7 +49,6 @@ class Candidate:
     ) -> Tuple[ca.FuncDef, int, ca.FileAST]:
         ast = ast_util.parse_c(source)
         orig_fn, fn_index = ast_util.extract_fn(ast, fn_name)
-        fn_index = ast_util.prune_ast(orig_fn, ast)
         ast_util.normalize_ast(orig_fn, ast)
         return orig_fn, fn_index, ast
 

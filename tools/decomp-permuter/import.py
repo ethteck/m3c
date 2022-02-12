@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
 # usage: ./import.py path/to/file.c path/to/asm.s [make flags]
-import sys
+import argparse
+from collections import defaultdict
+import json
 import os
 import platform
 import re
-import subprocess
-import shutil
-import argparse
 import shlex
+import shutil
+import subprocess
+import sys
 import toml
 from typing import Callable, Dict, List, Match, Mapping, Optional, Pattern, Set, Tuple
-from collections import defaultdict
+import urllib.request
+import urllib.parse
 
-from strip_other_fns import strip_other_fns_and_write
+from src import ast_util
+from src.compiler import Compiler
+from src.error import CandidateConstructionFailure
 
 is_macos = platform.system() == "Darwin"
 
 
 def homebrew_gcc_cpp() -> str:
-    lookup_path = "/usr/local/bin"
-    try:
-        return max(f for f in os.listdir(lookup_path) if f.startswith("cpp-"))
-    except ValueError:
-        print("Error while looking up in " + lookup_path + " for cpp- executable")
-        sys.exit(1)
+    lookup_paths = ["/usr/local/bin", "/opt/homebrew/bin"]
+
+    for lookup_path in lookup_paths:
+        try:
+            return max(f for f in os.listdir(lookup_path) if f.startswith("cpp-"))
+        except ValueError:
+            pass
+
+    print(
+        "Error while looking up in " + ":".join(lookup_paths) + " for cpp- executable"
+    )
+    sys.exit(1)
 
 
 cpp_cmd = homebrew_gcc_cpp() if is_macos else "cpp"
@@ -121,7 +132,7 @@ def find_root_dir(filename: str, pattern: List[str]) -> Optional[str]:
                 return dirname
         old_dirname = dirname
         dirname = os.path.dirname(dirname)
-    
+
     return None
 
 
@@ -165,7 +176,13 @@ def find_build_command_line(
     root_dir: str, c_file: str, make_flags: List[str], build_system: str
 ) -> Tuple[List[str], List[str]]:
     if build_system == "make":
-        build_invocation = [make_cmd, "--always-make", "--dry-run", "--debug=j", "PERMUTER=1"] + make_flags
+        build_invocation = [
+            make_cmd,
+            "--always-make",
+            "--dry-run",
+            "--debug=j",
+            "PERMUTER=1",
+        ] + make_flags
     elif build_system == "ninja":
         build_invocation = ["ninja", "-t", "commands"] + make_flags
     else:
@@ -275,7 +292,9 @@ def build_preserve_macros(
 def preprocess_c_with_macros(
     cpp_command: List[str], cwd: str, preserve_macros: PreserveMacros
 ) -> Tuple[str, List[str]]:
-    """Import C file, preserving function macros. Subroutine of import_c_file."""
+    """Import C file, preserving function macros. Subroutine of import_c_file.
+
+    Returns the source code and a list of preserved macros."""
 
     preserve_regex, preserve_type_fn = preserve_macros
 
@@ -401,7 +420,12 @@ def import_c_file(
     cwd: str,
     in_file: str,
     preserve_macros: Optional[PreserveMacros],
-) -> Tuple[str, List[str]]:
+) -> str:
+    """Preprocess a C file into permuter-usable source.
+
+    Prints preserved macros as a side effect.
+
+    Returns source for base.c and compilable (macro-expanded) source."""
     in_file = os.path.relpath(in_file, cwd)
     include_next = 0
     cpp_command = CPP + [in_file, "-D__sgi", "-D_LANGUAGE_C", "-DNON_MATCHING"]
@@ -426,14 +450,12 @@ def import_c_file(
     try:
         if preserve_macros is None:
             # Simple codepath, should work even if the more complex one breaks.
-            return (
-                subprocess.check_output(
-                    cpp_command + STUB_FN_MACROS, cwd=cwd, encoding="utf-8"
-                ),
-                [],
+            source = subprocess.check_output(
+                cpp_command + STUB_FN_MACROS, cwd=cwd, encoding="utf-8"
             )
-
-        return preprocess_c_with_macros(cpp_command, cwd, preserve_macros)
+            macros: List[str] = []
+        else:
+            source, macros = preprocess_c_with_macros(cpp_command, cwd, preserve_macros)
 
     except subprocess.CalledProcessError as e:
         print(
@@ -443,11 +465,138 @@ def import_c_file(
         )
         sys.exit(1)
 
+    if macros:
+        macro_str = "macros: " + ", ".join(macros)
+    else:
+        macro_str = "no macros"
+    print(f"Preserving {macro_str}. Use --preserve-macros='<regex>' to override.")
+
+    return source
+
+
+def prune_source(
+    source: str, should_prune: bool, func_name: str
+) -> Tuple[str, Optional[str]]:
+    """Normalize the source by round-tripping it through pycparser, and
+    optionally reduce it to a smaller version that includes only the imported
+    function and functions/struct/variables that it uses.
+
+    Returns (source, compilable_source)."""
+    try:
+        ast = ast_util.parse_c(source, from_import=True)
+        orig_fn, _ = ast_util.extract_fn(ast, func_name)
+        if should_prune:
+            try:
+                ast_util.prune_ast(orig_fn, ast)
+                source = ast_util.to_c_raw(ast)
+            except Exception:
+                print(
+                    "Source minimization failed! "
+                    "You could try --no-prune as a workaround."
+                )
+                raise
+        return source, ast_util.to_c(ast, from_import=True)
+    except CandidateConstructionFailure as e:
+        print(e.message)
+        if should_prune and "PERM_" in source:
+            print(
+                "Please put in PERM macros after import, otherwise source "
+                "minimization does not work."
+            )
+        else:
+            print("Proceeding anyway, but expect errors when permuting!")
+        return source, None
+
+
+def prune_and_separate_context(
+    source: str, should_prune: bool, func_name: str
+) -> Tuple[str, str]:
+    """Normalize the source by round-tripping it through pycparser, optionally
+    reduce it to a smaller version that includes only the imported function and
+    functions/struct/variables that it uses, and split the result into source
+    for the function itself, and the rest of the file (the "context").
+
+    Returns (source, context)."""
+    try:
+        ast = ast_util.parse_c(source, from_import=True)
+        orig_fn, ind = ast_util.extract_fn(ast, func_name)
+        if should_prune:
+            try:
+                ind = ast_util.prune_ast(orig_fn, ast)
+            except Exception:
+                print(
+                    "Source minimization failed! "
+                    "You could try --no-prune as a workaround."
+                )
+                raise
+        del ast.ext[ind]
+        source = ast_util.to_c(orig_fn, from_import=True)
+        context = ast_util.to_c(ast, from_import=True)
+        return source, context
+    except CandidateConstructionFailure as e:
+        print(e.message)
+        print("Unable to split context from source.")
+        print("Proceeding anyway, but expect compile errors!")
+        return ast_util.process_pragmas(source), ""
+
+
+def get_decompme_compiler_name(
+    compiler: List[str], settings: Mapping[str, object], api_base: str
+) -> str:
+    decompme_settings = settings.get("decompme", {})
+    assert isinstance(decompme_settings, dict)
+    compiler_mappings = decompme_settings.get("compilers", {})
+    assert isinstance(compiler_mappings, dict)
+
+    compiler_path = compiler[0]
+
+    for path, compiler_name in compiler_mappings.items():
+        assert isinstance(compiler_name, str)
+        if path == compiler_path:
+            return compiler_name
+
+    try:
+        with urllib.request.urlopen(f"{api_base}/api/compilers") as f:
+            json_data = json.load(f)
+            available = json_data["compiler_ids"]
+            if not isinstance(available, list):
+                raise Exception("compiler_ids must be a list")
+            if not all(isinstance(name, str) for name in available):
+                raise Exception("compiler_ids must be a list of strings")
+    except Exception as e:
+        print(f"Failed to request available compilers from decomp.me:\n{e}")
+
+    print()
+    print(
+        f'Unable to map compiler path "{compiler_path}" to something '
+        "decomp.me understands."
+    )
+    trail = "permuter_settings.toml, where ... is one of: " + ", ".join(available)
+    if compiler_mappings:
+        print(
+            "Please add an entry:\n\n"
+            f'"{compiler_path}" = "..."\n\n'
+            f"to the [decompme.compilers] section of {trail}"
+        )
+    else:
+        print(
+            "Please add an section:\n\n"
+            "[decompme.compilers]\n"
+            f'"{compiler_path}" = "..."\n\n'
+            f"to {trail}"
+        )
+    sys.exit(1)
+
 
 def finalize_compile_command(cmdline: List[str]) -> str:
     quoted = [arg if arg == "|" else shlex.quote(arg) for arg in cmdline]
     ind = (quoted + ["|"]).index("|")
     return " ".join(quoted[:ind] + ['"$INPUT"'] + quoted[ind:] + ["-o", '"$OUTPUT"'])
+
+
+def get_compiler_flags(cmdline: List[str]) -> str:
+    flags = [b for a, b in zip(cmdline, cmdline[1:]) if a != "|" and b != "|"]
+    return " ".join(shlex.quote(flag) for flag in flags)
 
 
 def write_compile_command(compiler: List[str], cwd: str, out_file: str) -> None:
@@ -481,17 +630,21 @@ def compile_asm(assembler: List[str], cwd: str, in_file: str, out_file: str) -> 
         sys.exit(1)
 
 
-def compile_base(compile_script: str, in_file: str, out_file: str) -> None:
-    in_file = os.path.abspath(in_file)
-    out_file = os.path.abspath(out_file)
-    compile_cmd = [compile_script, in_file, "-o", out_file]
-    try:
-        subprocess.check_call(compile_cmd)
-    except subprocess.CalledProcessError:
+def compile_base(compile_script: str, source: str, c_file: str, out_file: str) -> None:
+    if "PERM_" in source:
         print(
-            "Warning: failed to compile .c file, you'll need to adjust it manually. "
-            f"Command line:\n{formatcmd(compile_cmd)}"
+            "Cannot test-compile imported code because it contains PERM macros. "
+            "It is recommended to put in PERM macros after import."
         )
+        return
+    escaped_c_file = json.dumps(c_file)
+    source = "#line 1 " + escaped_c_file + "\n" + source
+    compiler = Compiler(compile_script, show_errors=True)
+    o_file = compiler.compile(source)
+    if o_file:
+        shutil.move(o_file, out_file)
+    else:
+        print("Warning: failed to compile .c file.")
 
 
 def write_to_file(cont: str, filename: str) -> None:
@@ -499,36 +652,20 @@ def write_to_file(cont: str, filename: str) -> None:
         f.write(cont)
 
 
-def try_strip_other_fns_and_write(
-    source: str, func_name: str, base_c_file: str
-) -> None:
-    try:
-        strip_other_fns_and_write(source, func_name, base_c_file)
-    except Exception:
-        import traceback
-
-        traceback.print_exc()
-        print(
-            "Warning: failed to remove other functions. Edit {base_c_file} and remove them manually."
-        )
-        with open(base_c_file, "w", encoding="utf-8") as f:
-            f.write(source)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Import a function for use with the permuter. "
-        "Will create a new directory nonmatchings/<funcname>-<id>/."
+        description="""Import a function for use with the permuter.
+        Will create a new directory nonmatchings/<funcname>-<id>/."""
     )
     parser.add_argument(
         "c_file",
-        help="File containing the function. "
-        "Assumes that the file can be built with 'make' to create an .o file.",
+        help="""File containing the function.
+        Assumes that the file can be built with 'make' to create an .o file.""",
     )
     parser.add_argument(
         "asm_file",
-        help="File containing assembly for the function. "
-        "Must start with 'glabel <function_name>' and contain no other functions.",
+        help="""File containing assembly for the function.
+        Must start with 'glabel <function_name>' and contain no other functions.""",
     )
     parser.add_argument(
         "make_flags",
@@ -543,13 +680,33 @@ def main() -> None:
         "--preserve-macros",
         metavar="REGEX",
         dest="preserve_macros_regex",
-        help="Regex for which macros to preserve, or empty string for no macros. "
-        f"By default, this is read from {settings_files} in a parent directory of "
-        "the imported file. Type information is also read from this file.",
+        help=f"""Regex for which macros to preserve, or empty string for no macros.
+        By default, this is read from {settings_files} in a parent directory of
+        the imported file. Type information is also read from this file.""",
+    )
+    parser.add_argument(
+        "--no-prune",
+        dest="prune",
+        action="store_false",
+        help="""Don't minimize the source to keep only the imported function and
+        functions/struct/variables that it uses. Normally this behavior is
+        useful to make the permuter faster, but in cases where unrelated code
+        affects the generated assembly asm it can be necessary to turn off.
+        Note that regardless of this setting the permuter always removes all
+        other functions by replacing them with declarations.""",
+    )
+    parser.add_argument(
+        "--decompme",
+        dest="decompme",
+        action="store_true",
+        help="""Upload the function to decomp.me to share with other people,
+        instead of importing.""",
     )
     args = parser.parse_args()
 
-    root_dir = find_root_dir(args.c_file, SETTINGS_FILES + ["Makefile", "makefile", "build.ninja"])
+    root_dir = find_root_dir(
+        args.c_file, SETTINGS_FILES + ["Makefile", "makefile", "build.ninja"]
+    )
 
     if not root_dir:
         print(f"Can't find root dir of project!", file=sys.stderr)
@@ -580,13 +737,47 @@ def main() -> None:
         assembler = shlex.split(assembler)
     else:
         assert isinstance(build_system, str)
-        compiler, assembler = find_build_command_line(root_dir, args.c_file, make_flags, build_system)
+        compiler, assembler = find_build_command_line(
+            root_dir, args.c_file, make_flags, build_system
+        )
 
     print(f"Compiler: {formatcmd(compiler)} {{input}} -o {{output}}")
     print(f"Assembler: {formatcmd(assembler)} {{input}} -o {{output}}")
 
-    preserve_macros = build_preserve_macros(root_dir, args.preserve_macros_regex, settings)
-    source, macros = import_c_file(compiler, root_dir, args.c_file, preserve_macros)
+    preserve_macros = build_preserve_macros(
+        root_dir, args.preserve_macros_regex, settings
+    )
+    source = import_c_file(compiler, root_dir, args.c_file, preserve_macros)
+
+    if args.decompme:
+        api_base = os.environ.get("DECOMPME_API_BASE", "https://decomp.me")
+        compiler_name = get_decompme_compiler_name(compiler, settings, api_base)
+        source, context = prune_and_separate_context(source, args.prune, func_name)
+        print("Uploading...")
+        try:
+            post_data = urllib.parse.urlencode(
+                {
+                    "target_asm": asm_cont,
+                    "context": context,
+                    "source_code": source,
+                    "compiler": compiler_name,
+                    "compiler_flags": get_compiler_flags(compiler),
+                }
+            ).encode("ascii")
+            with urllib.request.urlopen(f"{api_base}/api/scratch", post_data) as f:
+                resp = f.read()
+                json_data: Dict[str, str] = json.loads(resp)
+                if "slug" in json_data:
+                    slug = json_data["slug"]
+                    print(f"https://decomp.me/scratch/{slug}")
+                else:
+                    error = json_data.get("error", resp)
+                    print(f"Server error: {error}")
+        except Exception as e:
+            print(e)
+        return
+
+    source, compilable_source = prune_source(source, args.prune, func_name)
 
     dirname = create_directory(func_name)
     base_c_file = f"{dirname}/base.c"
@@ -597,24 +788,19 @@ def main() -> None:
     func_name_file = f"{dirname}/function.txt"
 
     try:
-        # try_strip_other_fns_and_write(source, func_name, base_c_file)
         write_to_file(source, base_c_file)
         write_to_file(func_name, func_name_file)
         write_compile_command(compiler, root_dir, compile_script)
         write_asm(asm_cont, target_s_file)
         compile_asm(assembler, root_dir, target_s_file, target_o_file)
-        compile_base(compile_script, base_c_file, base_o_file)
+        if compilable_source is not None:
+            compile_base(compile_script, compilable_source, base_c_file, base_o_file)
     except:
         if not args.keep:
             print(f"\nDeleting directory {dirname} (run with --keep to preserve it).")
             shutil.rmtree(dirname)
         raise
 
-    if macros:
-        macro_str = "macros: " + ", ".join(macros)
-    else:
-        macro_str = "no macros"
-    print(f"Preserving {macro_str}. Use --preserve-macros='<regex>' to override.")
     print(f"\nDone. Imported into {dirname}")
 
 

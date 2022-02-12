@@ -2,8 +2,6 @@ import bisect
 import copy
 from dataclasses import dataclass, field
 from random import Random
-import sys
-import time
 import typing
 from typing import (
     Any,
@@ -27,7 +25,6 @@ from .ast_types import (
     Type,
     TypeMap,
     allowed_basic_type,
-    basic_type,
     build_typemap,
     decayed_expr_type,
     get_decl_type,
@@ -370,7 +367,7 @@ def visit_replace(top_node: ca.Node, callback: Callable[[ca.Node, bool], Any]) -
         ):
             pass
         else:
-            _: None = node
+            _: ca.Alignas = node
             assert False, f"Node with unknown type: {node}"
         return node
 
@@ -395,11 +392,11 @@ def random_bool(random: Random, prob: float) -> bool:
 
 
 def random_weighted(random: Random, values: Sequence[Tuple[T, float]]) -> T:
-    assert values, "Cannot pick randomly from empty set"
     sumprob = 0.0
     for (val, prob) in values:
-        assert prob > 0, "Probabilities must be positive"
+        assert prob >= 0, "Probabilities must be non-negative"
         sumprob += prob
+    assert sumprob > 0, "Cannot pick randomly from empty set"
     targetprob = random.uniform(0, sumprob)
     sumprob = 0.0
     for (val, prob) in values:
@@ -408,7 +405,10 @@ def random_weighted(random: Random, values: Sequence[Tuple[T, float]]) -> T:
             return val
 
     # Float imprecision
-    return values[0][0]
+    for (val, prob) in values:
+        if prob > 0:
+            return val
+    assert False, "unreachable"
 
 
 def random_type(random: Random) -> SimpleType:
@@ -431,7 +431,7 @@ def random_type(random: Random) -> SimpleType:
     quals = []
     if random_bool(random, 0.5):
         quals = ["volatile"]
-    return ca.TypeDecl(declname=None, quals=quals, type=idtype)
+    return ca.TypeDecl(declname=None, quals=quals, align=[], type=idtype)
 
 
 def randomize_type(
@@ -456,6 +456,17 @@ def randomize_innermost_type(
         type.type, typemap, random, ensure_changed=ensure_changed
     )
     return new_type
+
+
+def ensure_arithmetic_type(expr: Expression, typemap: TypeMap) -> None:
+    type: SimpleType = decayed_expr_type(expr, typemap)
+    ensure(
+        allowed_basic_type(
+            type,
+            typemap,
+            ["int", "char", "long", "short", "signed", "unsigned", "float", "double"],
+        )
+    )
 
 
 def get_insertion_points(
@@ -758,7 +769,6 @@ def perm_expand_expr(
     # Step 2: find the assignment it uses
     reads = all_reads[var]
     writes = all_writes.get(var, [])
-    read = random.choice(reads)
     i = bisect.bisect_left(writes, index)
     # if i == 0, there is no write to replace the read by.
     ensure(i > 0)
@@ -842,6 +852,7 @@ def perm_randomize_internal_type(
         def visit_Decl(self, decl: ca.Decl) -> None:
             if isinstance(decl.type, ca.TypeDecl) and decl.name and decl.name in names:
                 decls.append(decl)
+            self.generic_visit(decl)
 
     Visitor().visit(fn)
 
@@ -904,6 +915,7 @@ def perm_randomize_function_type(
         def visit_FuncCall(self, node: ca.FuncCall) -> None:
             if region.contains_node(node) and isinstance(node.name, ca.ID):
                 names.add(node.name.name)
+            self.generic_visit(node)
 
     IdVisitor().visit(fn)
 
@@ -959,7 +971,9 @@ def perm_randomize_function_type(
             main_fndecl.type = random_type(random)
         elif random_bool(random, PROB_RET_VOID):
             idtype = ca.IdentifierType(names=["void"])
-            main_fndecl.type = ca.TypeDecl(declname=None, quals=[], type=idtype)
+            main_fndecl.type = ca.TypeDecl(
+                declname=None, quals=[], align=[], type=idtype
+            )
         else:
             main_fndecl.type = randomize_type(
                 type, typemap, random, ensure_changed=True
@@ -1016,6 +1030,11 @@ def perm_refer_to_var(
     ensure(ins_cands)
 
     cond = copy.deepcopy(expr)
+
+    # Repeat the condition up to two times: if (x && x && x) {} sometimes helps.
+    for i in range(random.choice((0, 0, 0, 0, 0, 1, 2, 2))):
+        cond = ca.BinaryOp("&&", cond, copy.deepcopy(expr))
+
     stmt = ca.If(cond=cond, iftrue=ca.Compound(block_items=[]), iffalse=None)
     tob, toi, _ = random.choice(ins_cands)
     ast_util.insert_statement(tob, toi, stmt)
@@ -1133,7 +1152,7 @@ def perm_sameline(
     )
 
 
-def perm_associative(
+def perm_commutative(
     fn: ca.FuncDef, ast: ca.FileAST, indices: Indices, region: Region, random: Random
 ) -> None:
     """Change a+b into b+a, or similar for other commutative operations."""
@@ -1144,6 +1163,7 @@ def perm_associative(
         def visit_BinaryOp(self, node: ca.BinaryOp) -> None:
             if node.op in commutative_ops and region.contains_node(node):
                 cands.append(node)
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1153,6 +1173,33 @@ def perm_associative(
         node.op = ">" + node.op[1:]
     elif node.op[0] == ">":
         node.op = "<" + node.op[1:]
+
+
+def perm_add_sub(
+    fn: ca.FuncDef, ast: ca.FileAST, indices: Indices, region: Region, random: Random
+) -> None:
+    """Change a-b into a+(-b), or a+b into a-(-b)."""
+    cands: List[ca.BinaryOp] = []
+
+    class Visitor(ca.NodeVisitor):
+        def visit_BinaryOp(self, node: ca.BinaryOp) -> None:
+            if node.op in ("+", "-") and region.contains_node(node):
+                cands.append(node)
+            self.generic_visit(node)
+
+    Visitor().visit(fn.body)
+    ensure(cands)
+    node = random.choice(cands)
+    node.left, node.right = node.right, node.left
+    node.op = "+" if node.op == "-" else "-"
+    if isinstance(node.right, ca.Constant):
+        val = node.right.value
+        node.right.value = val[1:] if val.startswith("-") else "-" + val
+    elif isinstance(node.right, ca.UnaryOp) and node.right.op == "-":
+        assert not isinstance(node.right.expr, ca.Typename)
+        node.right = node.right.expr
+    else:
+        node.right = ca.UnaryOp("-", node.right)
 
 
 def perm_condition(
@@ -1219,7 +1266,7 @@ def perm_condition(
 def perm_add_self_assignment(
     fn: ca.FuncDef, ast: ca.FileAST, indices: Indices, region: Region, random: Random
 ) -> None:
-    """Introduce a "x = x;" somewhere."""
+    """Introduce a "x = x;" or "x += 0;" somewhere."""
     cands = get_insertion_points(fn, region)
     vars: List[str] = []
 
@@ -1227,13 +1274,17 @@ def perm_add_self_assignment(
         def visit_Decl(self, decl: ca.Decl) -> None:
             if decl.name:
                 vars.append(decl.name)
+            self.generic_visit(decl)
 
     Visitor().visit(fn.body)
     ensure(vars)
     ensure(cands)
     var = random.choice(vars)
     where = random.choice(cands)
-    assignment = ca.Assignment("=", ca.ID(var), ca.ID(var))
+    if random_bool(random, 0.5):
+        assignment = ca.Assignment("=", ca.ID(var), ca.ID(var))
+    else:
+        assignment = ca.Assignment("+=", ca.ID(var), ca.Constant("int", "0"))
     ast_util.insert_statement(where[0], where[1], assignment)
 
 
@@ -1351,14 +1402,14 @@ def perm_compound_assignment(
 
     class Visitor(ca.NodeVisitor):
         def visit_Assignment(self, node: ca.Assignment) -> None:
-            if not region.contains_node(node):
-                return
-            if node.op != "=" or (
-                isinstance(node.rvalue, ca.BinaryOp)
-                and ast_util.equal_ast(node.lvalue, node.rvalue.left)
-                and node.rvalue.op in operators
-            ):
-                cands.append(node)
+            if region.contains_node(node):
+                if node.op != "=" or (
+                    isinstance(node.rvalue, ca.BinaryOp)
+                    and ast_util.equal_ast(node.lvalue, node.rvalue.left)
+                    and node.rvalue.op in operators
+                ):
+                    cands.append(node)
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1386,6 +1437,7 @@ def perm_inequalities(
         def visit_BinaryOp(self, node: ca.BinaryOp) -> None:
             if node.op in inequalities and region.contains_node(node):
                 cands.append(node)
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1455,12 +1507,65 @@ def perm_add_mask(
     replace_node(fn.body, expr, new_expr)
 
 
+def perm_xor_zero(
+    fn: ca.FuncDef, ast: ca.FileAST, indices: Indices, region: Region, random: Random
+) -> None:
+    """Add ^0 to a random expression of integer type, or *1 to floats."""
+    typemap = build_typemap(ast)
+
+    # Find a random expression
+    cands: List[Expression] = get_block_expressions(fn.body, region)
+    ensure(cands)
+
+    expr = random.choice(cands)
+    type: SimpleType = decayed_expr_type(expr, typemap)
+    int_types = ["int", "char", "long", "short", "signed", "unsigned"]
+
+    if allowed_basic_type(type, typemap, int_types):
+        new_expr = ca.BinaryOp("^", expr, ca.Constant("int", "0"))
+    elif allowed_basic_type(type, typemap, ["float"]):
+        new_expr = ca.BinaryOp("*", expr, ca.Constant("float", "1.0f"))
+    elif allowed_basic_type(type, typemap, ["double"]):
+        new_expr = ca.BinaryOp("*", expr, ca.Constant("double", "1.0"))
+    else:
+        raise RandomizationFailure
+
+    replace_node(fn.body, expr, new_expr)
+
+
+def perm_mult_zero(
+    fn: ca.FuncDef, ast: ca.FileAST, indices: Indices, region: Region, random: Random
+) -> None:
+    """Convert 0 to x*0 for some randomly chosen x."""
+    typemap = build_typemap(ast)
+
+    # Find all expressions in the region
+    cands: List[Expression] = get_block_expressions(fn.body, region)
+    ensure(cands)
+
+    # Find a random expression for x
+    expr = random.choice(cands)
+    ensure_arithmetic_type(expr, typemap)
+    ensure(not ast_util.is_effectful(expr))
+
+    # Find a random zero
+    zeroes = [
+        e
+        for e in cands
+        if isinstance(e, ca.Constant) and e.value in ("0", "0.0", "0.0f")
+    ]
+    ensure(zeroes)
+    zero = random.choice(zeroes)
+
+    new_expr = ca.BinaryOp("*", copy.deepcopy(expr), zero)
+
+    replace_node(fn.body, zero, new_expr)
+
+
 def perm_float_literal(
     fn: ca.FuncDef, ast: ca.FileAST, indices: Indices, region: Region, random: Random
 ) -> None:
     """Converts a Float Literal"""
-    typemap = build_typemap(ast)
-
     cands: List[ca.Constant] = []
 
     class Visitor(ca.NodeVisitor):
@@ -1511,14 +1616,7 @@ def perm_cast_simple(
     ensure(cands)
 
     expr = random.choice(cands)
-    type: SimpleType = decayed_expr_type(expr, typemap)
-    ensure(
-        allowed_basic_type(
-            type,
-            typemap,
-            ["int", "char", "long", "short", "signed", "unsigned", "float", "double"],
-        )
-    )
+    ensure_arithmetic_type(expr, typemap)
 
     integral_type = [["int"], ["char"], ["long"], ["short"], ["long", "long"]]
     floating_type = [["float"], ["double"]]
@@ -1532,8 +1630,8 @@ def perm_cast_simple(
         new_type = random.choice(floating_type)
 
     # Surround the original expression with a cast to the chosen type
-    typedecl = ca.TypeDecl(None, [], ca.IdentifierType(new_type))
-    new_expr = ca.Cast(ca.Typename(None, [], typedecl), expr)
+    typedecl = ca.TypeDecl(None, [], [], ca.IdentifierType(new_type))
+    new_expr = ca.Cast(ca.Typename(None, [], [], typedecl), expr)
     replace_node(fn.body, expr, new_expr)
 
 
@@ -1577,6 +1675,7 @@ def perm_struct_ref(
         def visit_StructRef(self, node: ca.StructRef) -> None:
             if region.contains_node(node):
                 cands.append(node)
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1719,6 +1818,7 @@ def perm_split_assignment(
                 and region.contains_node(node)
             ):
                 cands.append(node)
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1777,6 +1877,7 @@ def perm_remove_ast(
         def visit_Cast(self, node: ca.Cast) -> None:
             if region.contains_node(node):
                 cands.append((node, node.expr))
+            self.generic_visit(node)
 
         # Replace (a & constant) with (a).
         def visit_BinaryOp(self, node: ca.BinaryOp) -> None:
@@ -1785,23 +1886,24 @@ def perm_remove_ast(
                     cands.append((node, node.right))
                 if isinstance(node.right, ca.Constant):
                     cands.append((node, node.left))
+            self.generic_visit(node)
 
         # Remove if statements that don't have an else
         def visit_If(self, node: ca.If) -> None:
-            if node.iffalse:
-                return
-
-            if region.contains_node(node):
+            if not node.iffalse and region.contains_node(node):
                 cands.append((node, node.iftrue))
+            self.generic_visit(node)
 
         # Remove loops
         def visit_While(self, node: ca.While) -> None:
             if region.contains_node(node):
                 cands.append((node, node.stmt))
+            self.generic_visit(node)
 
         def visit_DoWhile(self, node: ca.DoWhile) -> None:
             if region.contains_node(node):
                 cands.append((node, node.stmt))
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1818,10 +1920,9 @@ def perm_duplicate_assignment(
 
     class Visitor(ca.NodeVisitor):
         def visit_Assignment(self, node: ca.Assignment) -> None:
-            if not region.contains_node(node):
-                return
-            if node.op == "=":
+            if region.contains_node(node) and node.op == "=":
                 cands.append(node)
+            self.generic_visit(node)
 
     Visitor().visit(fn.body)
     ensure(cands)
@@ -1845,6 +1946,7 @@ def perm_pad_var_decl(
         def visit_Decl(self, decl: ca.Decl) -> None:
             if decl.name:
                 vars.append(decl.name)
+            self.generic_visit(decl)
 
     Visitor().visit(fn.body)
 
@@ -1872,6 +1974,7 @@ class Randomizer:
             (perm_expand_expr, 20),
             (perm_reorder_stmts, 20),
             (perm_add_mask, 15),
+            (perm_xor_zero, 10),
             (perm_cast_simple, 10),
             (perm_refer_to_var, 10),
             (perm_float_literal, 10),
@@ -1884,9 +1987,11 @@ class Randomizer:
             (perm_struct_ref, 10),
             (perm_empty_stmt, 10),
             (perm_condition, 10),
+            (perm_mult_zero, 5),
             (perm_dummy_comma_expr, 5),
             (perm_add_self_assignment, 5),
-            (perm_associative, 5),
+            (perm_commutative, 5),
+            (perm_add_sub, 5),
             (perm_inequalities, 5),
             (perm_compound_assignment, 5),
             (perm_remove_ast, 5),
