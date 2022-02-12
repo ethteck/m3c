@@ -5,7 +5,7 @@
 ;
 [subrepo]
 	remote = https://github.com/simonlindholm/decomp-permuter.git
-	branch = master
+	branch = main
 	commit = ed20f0f7c552fabc6c3ea406070dae3315725646
 	parent = a3eb0916597802c60d90effc3001aa24533ef195
 	method = merge
