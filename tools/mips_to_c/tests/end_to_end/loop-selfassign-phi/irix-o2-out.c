@@ -1,3 +1,5 @@
+s32 func_004000F4(s32);                             /* static */
+
 void test(s32 arg0) {
     s32 phi_s0;
 

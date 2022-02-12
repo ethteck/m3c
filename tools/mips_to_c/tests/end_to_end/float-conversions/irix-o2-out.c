@@ -1,4 +1,8 @@
-u32 *test(void) {
+extern f32 D_410230;
+extern f64 D_410238;
+extern u32 D_410240;
+
+void test(void) {
     f32 temp_f8;
     f64 temp_f18;
     u32 temp_t0;
@@ -22,5 +26,4 @@ u32 *test(void) {
         phi_f8 = temp_f8 + 4294967296.0f;
     }
     D_410230 = phi_f8;
-    return &D_410240;
 }

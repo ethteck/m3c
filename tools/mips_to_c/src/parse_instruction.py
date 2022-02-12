@@ -1,85 +1,18 @@
 """Functions and classes useful for parsing an arbitrary MIPS instruction.
 """
-import re
+import abc
+import csv
+from dataclasses import dataclass, replace
 import string
-import sys
-from typing import List, Optional, Set, Union
-
-import attr
+from typing import Dict, List, Optional, Set, Union
 
 from .error import DecompFailure
-
-LENGTH_TWO: Set[str] = {
-    "neg",
-    "negu",
-    "not",
-    "neg.s",
-    "abs.s",
-    "sqrt.s",
-    "neg.d",
-    "abs.d",
-    "sqrt.d",
-}
-
-LENGTH_THREE: Set[str] = {
-    "slt",
-    "slti",
-    "sltu",
-    "sltiu",
-    "addi",
-    "addiu",
-    "addu",
-    "subu",
-    "daddi",
-    "daddiu",
-    "dsubu",
-    "add.s",
-    "sub.s",
-    "div.s",
-    "mul.s",
-    "add.d",
-    "sub.d",
-    "div.d",
-    "mul.d",
-    "ori",
-    "and",
-    "or",
-    "nor",
-    "xor",
-    "andi",
-    "xori",
-    "sll",
-    "sllv",
-    "srl",
-    "srlv",
-    "sra",
-    "srav",
-    "dsll",
-    "dsll32",
-    "dsllv",
-    "dsrl",
-    "dsrl32",
-    "dsrlv",
-    "dsra",
-    "dsra32",
-    "dsrav",
-}
-
-DIV_MULT_INSTRUCTIONS: Set[str] = {
-    "div",
-    "divu",
-    "ddiv",
-    "ddivu",
-    "mult",
-    "multu",
-    "dmult",
-    "dmultu",
-}
+from .options import Target
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class Register:
-    register_name: str = attr.ib()
+    register_name: str
 
     def is_float(self) -> bool:
         name = self.register_name
@@ -96,18 +29,18 @@ class Register:
         return f"${self.register_name}"
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class AsmGlobalSymbol:
-    symbol_name: str = attr.ib()
+    symbol_name: str
 
     def __str__(self) -> str:
         return self.symbol_name
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class AsmSectionGlobalSymbol(AsmGlobalSymbol):
-    section_name: str = attr.ib()
-    addend: int = attr.ib()
+    section_name: str
+    addend: int
 
 
 def asm_section_global_symbol(section_name: str, addend: int) -> AsmSectionGlobalSymbol:
@@ -118,18 +51,18 @@ def asm_section_global_symbol(section_name: str, addend: int) -> AsmSectionGloba
     )
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class Macro:
-    macro_name: str = attr.ib()
-    argument: "Argument" = attr.ib()  # forward-declare
+    macro_name: str
+    argument: "Argument"
 
     def __str__(self) -> str:
         return f"%{self.macro_name}({self.argument})"
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class AsmLiteral:
-    value: int = attr.ib()
+    value: int
 
     def signed_value(self) -> int:
         return ((self.value + 0x8000) & 0xFFFF) - 0x8000
@@ -138,37 +71,35 @@ class AsmLiteral:
         return hex(self.value)
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class AsmAddressMode:
-    lhs: Union[AsmLiteral, Macro, None] = attr.ib()
-    rhs: Register = attr.ib()
+    lhs: "Argument"
+    rhs: Register
 
     def lhs_as_literal(self) -> int:
-        if not self.lhs:
-            return 0
         assert isinstance(self.lhs, AsmLiteral)
         return self.lhs.signed_value()
 
     def __str__(self) -> str:
-        if self.lhs is not None:
-            return f"{self.lhs}({self.rhs})"
-        else:
+        if self.lhs == AsmLiteral(0):
             return f"({self.rhs})"
+        else:
+            return f"{self.lhs}({self.rhs})"
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class BinOp:
-    op: str = attr.ib()
-    lhs: "Argument" = attr.ib()
-    rhs: "Argument" = attr.ib()
+    op: str
+    lhs: "Argument"
+    rhs: "Argument"
 
     def __str__(self) -> str:
         return f"{self.lhs} {self.op} {self.rhs}"
 
 
-@attr.s(frozen=True)
+@dataclass(frozen=True)
 class JumpTarget:
-    target: str = attr.ib()
+    target: str
 
     def __str__(self) -> str:
         return f".{self.target}"
@@ -178,7 +109,141 @@ Argument = Union[
     Register, AsmGlobalSymbol, AsmAddressMode, Macro, AsmLiteral, BinOp, JumpTarget
 ]
 
-valid_word = string.ascii_letters + string.digits + "_"
+
+@dataclass(frozen=True)
+class InstructionMeta:
+    emit_goto: bool
+    filename: str
+    lineno: int
+    synthetic: bool
+
+    @staticmethod
+    def missing() -> "InstructionMeta":
+        return InstructionMeta(
+            emit_goto=False, filename="<unknown>", lineno=0, synthetic=True
+        )
+
+    def loc_str(self) -> str:
+        adj = "near" if self.synthetic else "at"
+        return f"{adj} {self.filename} line {self.lineno}"
+
+
+@dataclass(frozen=True)
+class Instruction:
+    mnemonic: str
+    args: List[Argument]
+    meta: InstructionMeta
+
+    @staticmethod
+    def derived(
+        mnemonic: str, args: List[Argument], old: "Instruction"
+    ) -> "Instruction":
+        return Instruction(mnemonic, args, replace(old.meta, synthetic=True))
+
+    def __str__(self) -> str:
+        if not self.args:
+            return self.mnemonic
+        args = ", ".join(str(arg) for arg in self.args)
+        return f"{self.mnemonic} {args}"
+
+    def arch_mnemonic(self, arch: "ArchAsm") -> str:
+        """Combine architecture name with mnemonic for pattern matching"""
+        return f"{arch.arch}:{self.mnemonic}"
+
+
+class ArchAsmParsing(abc.ABC):
+    """Arch-specific information needed to parse asm."""
+
+    all_regs: List[Register]
+    aliased_regs: Dict[str, Register]
+
+    @abc.abstractmethod
+    def normalize_instruction(self, instr: Instruction) -> Instruction:
+        ...
+
+
+class ArchAsm(ArchAsmParsing):
+    """Arch-specific information that relates to the asm level. Extends the above."""
+
+    arch: Target.ArchEnum
+
+    stack_pointer_reg: Register
+    frame_pointer_reg: Optional[Register]
+    return_address_reg: Register
+
+    base_return_regs: List[Register]
+    all_return_regs: List[Register]
+    argument_regs: List[Register]
+    simple_temp_regs: List[Register]
+    temp_regs: List[Register]
+    saved_regs: List[Register]
+    all_regs: List[Register]
+
+    aliased_regs: Dict[str, Register]
+
+    uses_delay_slots: bool
+
+    @abc.abstractmethod
+    def is_branch_instruction(self, instr: Instruction) -> bool:
+        """Instructions with a label as a jump target (may be conditional)"""
+        ...
+
+    @abc.abstractmethod
+    def is_branch_likely_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def is_constant_branch_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def is_conditional_return_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def is_jump_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def is_delay_slot_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def is_return_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def is_jumptable_instruction(self, instr: Instruction) -> bool:
+        ...
+
+    @abc.abstractmethod
+    def missing_return(self) -> List[Instruction]:
+        ...
+
+    @staticmethod
+    def get_branch_target(instr: Instruction) -> JumpTarget:
+        label = instr.args[-1]
+        if isinstance(label, AsmGlobalSymbol):
+            return JumpTarget(label.symbol_name)
+        if not isinstance(label, JumpTarget):
+            raise DecompFailure(
+                f'Couldn\'t parse instruction "{instr}": invalid branch target'
+            )
+        return label
+
+
+class NaiveParsingArch(ArchAsmParsing):
+    """A fake arch that can parse asm in a naive fashion. Used by the pattern matching
+    machinery to reduce arch dependence."""
+
+    all_regs: List[Register] = []
+    aliased_regs: Dict[str, Register] = {}
+
+    def normalize_instruction(self, instr: Instruction) -> Instruction:
+        return instr
+
+
+valid_word = string.ascii_letters + string.digits + "_$"
 valid_number = "-xX" + string.hexdigits
 
 
@@ -219,10 +284,11 @@ def constant_fold(arg: Argument) -> Argument:
 
 
 # Main parser.
-def parse_arg_elems(arg_elems: List[str]) -> Optional[Argument]:
+def parse_arg_elems(arg_elems: List[str], arch: ArchAsmParsing) -> Optional[Argument]:
     value: Optional[Argument] = None
 
     def expect(n: str) -> str:
+        assert arg_elems, f"Expected one of {list(n)}, but reached end of string"
         g = arg_elems.pop(0)
         assert g in n, f"Expected one of {list(n)}, got {g} (rest: {arg_elems})"
         return g
@@ -232,16 +298,21 @@ def parse_arg_elems(arg_elems: List[str]) -> Optional[Argument]:
         if tok.isspace():
             # Ignore whitespace.
             arg_elems.pop(0)
+        elif tok == ",":
+            expect(",")
+            break
         elif tok == "$":
             # Register.
             assert value is None
-            arg_elems.pop(0)
-            reg = parse_word(arg_elems)
-            if reg == "s8":
-                reg = "fp"
-            if reg == "r0":
-                reg = "zero"
-            value = Register(reg)
+            word = parse_word(arg_elems)
+            reg = word[1:]
+            if "$" in reg:
+                # If there is a second $ in the word, it's a symbol
+                value = AsmGlobalSymbol(word)
+            elif reg in arch.aliased_regs:
+                value = arch.aliased_regs[reg]
+            else:
+                value = Register(reg)
         elif tok == ".":
             # Either a jump target (i.e. a label), or a section reference.
             assert value is None
@@ -259,8 +330,9 @@ def parse_arg_elems(arg_elems: List[str]) -> Optional[Argument]:
             assert macro_name in ("hi", "lo")
             expect("(")
             # Get the argument of the macro (which must exist).
-            m = parse_arg_elems(arg_elems)
+            m = parse_arg_elems(arg_elems, arch)
             assert m is not None
+            m = constant_fold(m)
             expect(")")
             # A macro may be the lhs of an AsmAddressMode, so we don't return here.
             value = Macro(macro_name, m)
@@ -273,223 +345,113 @@ def parse_arg_elems(arg_elems: List[str]) -> Optional[Argument]:
             value = AsmLiteral(parse_number(arg_elems))
         elif tok == "(":
             # Address mode or binary operation.
-            # There was possibly an offset, so value could be a AsmLiteral or Macro.
-            assert value is None or isinstance(value, (AsmLiteral, Macro))
             expect("(")
             # Get what is being dereferenced.
-            rhs = parse_arg_elems(arg_elems)
+            rhs = parse_arg_elems(arg_elems, arch)
             assert rhs is not None
             expect(")")
             if isinstance(rhs, BinOp):
                 # Binary operation.
+                assert value is None
                 value = constant_fold(rhs)
             else:
                 # Address mode.
                 assert isinstance(rhs, Register)
-                value = AsmAddressMode(value, rhs)
+                value = AsmAddressMode(value or AsmLiteral(0), rhs)
         elif tok in valid_word:
             # Global symbol.
             assert value is None
-            value = AsmGlobalSymbol(parse_word(arg_elems))
-        elif tok in ">+-&*":
+            word = parse_word(arg_elems)
+            maybe_reg = Register(word)
+            if word in arch.aliased_regs:
+                value = arch.aliased_regs[word]
+            elif maybe_reg in arch.all_regs:
+                value = maybe_reg
+            else:
+                value = AsmGlobalSymbol(word)
+        elif tok in "<>+-&*":
             # Binary operators, used e.g. to modify global symbols or constants.
-            assert isinstance(value, (AsmLiteral, AsmGlobalSymbol))
+            assert isinstance(value, (AsmLiteral, AsmGlobalSymbol, BinOp))
 
-            if tok == ">":
-                expect(">")
-                expect(">")
-                op = ">>"
+            if tok in "<>":
+                # bitshifts
+                expect(tok)
+                expect(tok)
+                op = tok + tok
             else:
                 op = expect("&+-*")
 
-            rhs = parse_arg_elems(arg_elems)
-            # These operators can only use constants as the right-hand-side.
-            if rhs and isinstance(rhs, BinOp) and rhs.op == "*":
-                rhs = constant_fold(rhs)
-            if isinstance(rhs, BinOp) and isinstance(constant_fold(rhs), AsmLiteral):
-                raise DecompFailure(
-                    "Math is too complicated for mips_to_c. Try adding parentheses."
-                )
-            assert isinstance(rhs, AsmLiteral)
-            if isinstance(value, AsmSectionGlobalSymbol):
-                return asm_section_global_symbol(
-                    value.section_name, value.addend + rhs.value
-                )
-            return BinOp(op, value, rhs)
+            if tok == "-" and arg_elems[0] == "_":
+                # Parse `sym-_SDA_BASE_` as a Macro, equivalently to `sym@sda21`
+                reloc_name = parse_word(arg_elems)
+                if reloc_name not in ("_SDA_BASE_", "_SDA2_BASE_"):
+                    raise DecompFailure(
+                        f"Unexpected symbol {reloc_name} in subtraction expression"
+                    )
+                value = Macro("sda21", value)
+            else:
+                rhs = parse_arg_elems(arg_elems, arch)
+                assert rhs is not None
+                if isinstance(rhs, BinOp) and rhs.op == "*":
+                    rhs = constant_fold(rhs)
+                if isinstance(rhs, BinOp) and isinstance(
+                    constant_fold(rhs), AsmLiteral
+                ):
+                    raise DecompFailure(
+                        "Math is too complicated for mips_to_c. Try adding parentheses."
+                    )
+                if isinstance(rhs, AsmLiteral) and isinstance(
+                    value, AsmSectionGlobalSymbol
+                ):
+                    value = asm_section_global_symbol(
+                        value.section_name, value.addend + rhs.value
+                    )
+                else:
+                    value = BinOp(op, value, rhs)
+        elif tok == "@":
+            # A relocation (e.g. (...)@ha or (...)@l).
+            arg_elems.pop(0)
+            reloc_name = parse_word(arg_elems)
+            assert reloc_name in ("h", "ha", "l", "sda2", "sda21")
+            assert value
+            value = Macro(reloc_name, value)
         else:
             assert False, f"Unknown token {tok} in {arg_elems}"
 
     return value
 
 
-def parse_arg(arg: str) -> Optional[Argument]:
-    arg_elems: List[str] = list(arg)
-    return parse_arg_elems(arg_elems)
+def parse_arg(arg: str, arch: ArchAsmParsing) -> Argument:
+    arg_elems: List[str] = list(arg.strip())
+    ret = parse_arg_elems(arg_elems, arch)
+    assert ret is not None
+    return constant_fold(ret)
 
 
-@attr.s(frozen=True)
-class InstructionMeta:
-    emit_goto: bool = attr.ib()
-    filename: str = attr.ib()
-    lineno: int = attr.ib()
-    synthetic: bool = attr.ib()
-
-    @staticmethod
-    def missing() -> "InstructionMeta":
-        return InstructionMeta(
-            emit_goto=False, filename="<unknown>", lineno=0, synthetic=True
+def split_arg_list(args: str) -> List[str]:
+    """Split a string of comma-separated arguments, handling quotes"""
+    return next(
+        csv.reader(
+            [args],
+            delimiter=",",
+            doublequote=False,
+            escapechar="\\",
+            quotechar='"',
+            skipinitialspace=True,
         )
-
-    def loc_str(self) -> str:
-        adj = "near" if self.synthetic else "at"
-        return f"{adj} {self.filename} line {self.lineno}"
+    )
 
 
-@attr.s(frozen=True)
-class Instruction:
-    mnemonic: str = attr.ib()
-    args: List[Argument] = attr.ib()
-    meta: InstructionMeta = attr.ib()
-
-    @staticmethod
-    def derived(
-        mnemonic: str, args: List[Argument], old: "Instruction"
-    ) -> "Instruction":
-        return Instruction(mnemonic, args, attr.evolve(old.meta, synthetic=True))
-
-    def is_branch_instruction(self) -> bool:
-        return (
-            self.mnemonic
-            in [
-                "j",
-                "b",
-                "beq",
-                "bne",
-                "beqz",
-                "bnez",
-                "bgez",
-                "bgtz",
-                "blez",
-                "bltz",
-                "bc1t",
-                "bc1f",
-            ]
-            or self.is_branch_likely_instruction()
-        )
-
-    def is_branch_likely_instruction(self) -> bool:
-        return self.mnemonic in [
-            "beql",
-            "bnel",
-            "beqzl",
-            "bnezl",
-            "bgezl",
-            "bgtzl",
-            "blezl",
-            "bltzl",
-            "bc1tl",
-            "bc1fl",
-        ]
-
-    def get_branch_target(self) -> JumpTarget:
-        label = self.args[-1]
-        if isinstance(label, AsmGlobalSymbol):
-            return JumpTarget(label.symbol_name)
-        if not isinstance(label, JumpTarget):
-            raise DecompFailure(
-                f'Couldn\'t parse instruction "{self}": invalid branch target'
-            )
-        return label
-
-    def is_jump_instruction(self) -> bool:
-        # (we don't treat jal/jalr as jumps, since control flow will return
-        # after the call)
-        return self.is_branch_instruction() or self.mnemonic == "jr"
-
-    def is_delay_slot_instruction(self) -> bool:
-        return self.is_branch_instruction() or self.mnemonic in [
-            "jr",
-            "jal",
-            "jalr",
-        ]
-
-    def __str__(self) -> str:
-        args = ", ".join(str(arg) for arg in self.args)
-        return f"{self.mnemonic} {args}"
-
-
-def normalize_instruction(instr: Instruction) -> Instruction:
-    args = instr.args
-    if len(args) == 3:
-        if instr.mnemonic == "sll" and args[0] == args[1] == Register("zero"):
-            return Instruction("nop", [], instr.meta)
-        if instr.mnemonic == "or" and args[2] == Register("zero"):
-            return Instruction("move", args[:2], instr.meta)
-        if instr.mnemonic == "addu" and args[2] == Register("zero"):
-            return Instruction("move", args[:2], instr.meta)
-        if instr.mnemonic == "daddu" and args[2] == Register("zero"):
-            return Instruction("move", args[:2], instr.meta)
-        if instr.mnemonic == "nor" and args[1] == Register("zero"):
-            return Instruction("not", [args[0], args[2]], instr.meta)
-        if instr.mnemonic == "nor" and args[2] == Register("zero"):
-            return Instruction("not", [args[0], args[1]], instr.meta)
-        if instr.mnemonic == "addiu" and args[2] == AsmLiteral(0):
-            return Instruction("move", args[:2], instr.meta)
-        if instr.mnemonic in DIV_MULT_INSTRUCTIONS:
-            if args[0] != Register("zero"):
-                raise DecompFailure("first argument to div/mult must be $zero")
-            return Instruction(instr.mnemonic, args[1:], instr.meta)
-        if (
-            instr.mnemonic == "ori"
-            and args[1] == Register("zero")
-            and isinstance(args[2], AsmLiteral)
-        ):
-            lit = AsmLiteral(args[2].value & 0xFFFF)
-            return Instruction("li", [args[0], lit], instr.meta)
-        if (
-            instr.mnemonic == "addiu"
-            and args[1] == Register("zero")
-            and isinstance(args[2], AsmLiteral)
-        ):
-            lit = AsmLiteral(((args[2].value + 0x8000) & 0xFFFF) - 0x8000)
-            return Instruction("li", [args[0], lit], instr.meta)
-        if instr.mnemonic == "beq" and args[0] == args[1] == Register("zero"):
-            return Instruction("b", [args[2]], instr.meta)
-        if instr.mnemonic in ["bne", "beq", "beql", "bnel"] and args[1] == Register(
-            "zero"
-        ):
-            mn = instr.mnemonic[:3] + "z" + instr.mnemonic[3:]
-            return Instruction(mn, [args[0], args[2]], instr.meta)
-    if len(args) == 2:
-        if instr.mnemonic == "beqz" and args[0] == Register("zero"):
-            return Instruction("b", [args[1]], instr.meta)
-        if instr.mnemonic == "lui" and isinstance(args[1], AsmLiteral):
-            lit = AsmLiteral((args[1].value & 0xFFFF) << 16)
-            return Instruction("li", [args[0], lit], instr.meta)
-        if instr.mnemonic in LENGTH_THREE:
-            return normalize_instruction(
-                Instruction(instr.mnemonic, [args[0]] + args, instr.meta)
-            )
-    if len(args) == 1:
-        if instr.mnemonic in LENGTH_TWO:
-            return normalize_instruction(
-                Instruction(instr.mnemonic, [args[0]] + args, instr.meta)
-            )
-    return instr
-
-
-def parse_instruction(line: str, meta: InstructionMeta) -> Instruction:
+def parse_instruction(
+    line: str, meta: InstructionMeta, arch: ArchAsmParsing
+) -> Instruction:
     try:
         # First token is instruction name, rest is args.
         line = line.strip()
         mnemonic, _, args_str = line.partition(" ")
         # Parse arguments.
-        args: List[Argument] = list(
-            filter(
-                None, [parse_arg(arg_str.strip()) for arg_str in args_str.split(",")]
-            )
-        )
+        args = [parse_arg(arg_str, arch) for arg_str in split_arg_list(args_str)]
         instr = Instruction(mnemonic, args, meta)
-        return normalize_instruction(instr)
-    except Exception as e:
+        return arch.normalize_instruction(instr)
+    except Exception:
         raise DecompFailure(f"Failed to parse instruction {meta.loc_str()}: {line}")

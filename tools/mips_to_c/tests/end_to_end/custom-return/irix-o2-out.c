@@ -1,3 +1,6 @@
+s32 func_0040010C(?);                               /* static */
+extern s32 D_410120;
+
 s32 test(void) {
     s32 temp_v0;
 

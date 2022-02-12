@@ -1,15 +1,29 @@
 """This file handles variable types, function signatures and struct layouts
 based on a C AST. Based on the pycparser library."""
 
-from collections import defaultdict
 import copy
 import functools
-from typing import Any, Dict, Iterator, Match, Set, List, Tuple, Optional, Union
+import hashlib
+import pickle
 import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import (
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Match,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
-import attr
 from pycparser import c_ast as ca
-from pycparser.c_ast import ArrayDecl, TypeDecl, PtrDecl, FuncDecl, IdentifierType
+from pycparser.c_ast import ArrayDecl, FuncDecl, IdentifierType, PtrDecl, TypeDecl
 from pycparser.c_generator import CGenerator
 from pycparser.c_parser import CParser
 from pycparser.plyparser import ParseError
@@ -19,55 +33,68 @@ from .error import DecompFailure
 CType = Union[PtrDecl, ArrayDecl, TypeDecl, FuncDecl]
 StructUnion = Union[ca.Struct, ca.Union]
 SimpleType = Union[PtrDecl, TypeDecl]
+CParserScope = Dict[str, bool]
 
 
-@attr.s
+@dataclass
 class StructField:
-    type: CType = attr.ib()
-    size: int = attr.ib()
-    name: str = attr.ib()
+    type: CType
+    size: int
+    name: str
 
 
-@attr.s
+@dataclass
 class Struct:
-    fields: Dict[int, List[StructField]] = attr.ib()
+    type: CType
+    fields: Dict[int, List[StructField]]
     # TODO: bitfields
-    size: int = attr.ib()
-    align: int = attr.ib()
+    has_bitfields: bool
+    size: int
+    align: int
 
 
-@attr.s
+@dataclass
 class Array:
-    subtype: "DetailedStructMember" = attr.ib()
-    subctype: CType = attr.ib()
-    subsize: int = attr.ib()
-    dim: int = attr.ib()
+    subtype: "DetailedStructMember"
+    subctype: CType
+    subsize: int
+    dim: int
 
 
 DetailedStructMember = Union[Array, Struct, None]
 
 
-@attr.s
+@dataclass
 class Param:
-    type: CType = attr.ib()
-    name: Optional[str] = attr.ib()
+    type: CType
+    name: Optional[str]
 
 
-@attr.s
+@dataclass
 class Function:
-    ret_type: Optional[CType] = attr.ib()
-    params: Optional[List[Param]] = attr.ib()
-    is_variadic: bool = attr.ib()
+    type: CType
+    ret_type: Optional[CType]
+    params: Optional[List[Param]]
+    is_variadic: bool
 
 
-@attr.s
+@dataclass(eq=False)
 class TypeMap:
-    typedefs: Dict[str, CType] = attr.ib(factory=dict)
-    var_types: Dict[str, CType] = attr.ib(factory=dict)
-    functions: Dict[str, Function] = attr.ib(factory=dict)
-    named_structs: Dict[str, Struct] = attr.ib(factory=dict)
-    anon_structs: Dict[int, Struct] = attr.ib(factory=dict)
-    enum_values: Dict[str, int] = attr.ib(factory=dict)
+    # Change VERSION if TypeMap changes to invalidate all preexisting caches
+    VERSION: ClassVar[int] = 3
+
+    cparser_scope: CParserScope = field(default_factory=dict)
+    source_hash: Optional[str] = None
+
+    typedefs: Dict[str, CType] = field(default_factory=dict)
+    var_types: Dict[str, CType] = field(default_factory=dict)
+    vars_with_initializers: Set[str] = field(default_factory=set)
+    functions: Dict[str, Function] = field(default_factory=dict)
+    structs: Dict[Union[str, StructUnion], Struct] = field(default_factory=dict)
+    struct_typedefs: Dict[Union[str, StructUnion], TypeDecl] = field(
+        default_factory=dict
+    )
+    enum_values: Dict[str, int] = field(default_factory=dict)
 
 
 def to_c(node: ca.Node) -> str:
@@ -76,7 +103,7 @@ def to_c(node: ca.Node) -> str:
 
 def basic_type(names: List[str]) -> TypeDecl:
     idtype = IdentifierType(names=names)
-    return TypeDecl(declname=None, quals=[], type=idtype)
+    return TypeDecl(declname=None, quals=[], type=idtype, align=[])
 
 
 def pointer(type: CType) -> CType:
@@ -94,20 +121,6 @@ def resolve_typedefs(type: CType, typemap: TypeMap) -> CType:
     return type
 
 
-def pointer_decay(type: CType, typemap: TypeMap) -> SimpleType:
-    real_type = resolve_typedefs(type, typemap)
-    if isinstance(real_type, ArrayDecl):
-        return PtrDecl(quals=[], type=real_type.type)
-    if isinstance(real_type, FuncDecl):
-        return PtrDecl(quals=[], type=type)
-    if isinstance(real_type, TypeDecl) and isinstance(real_type.type, ca.Enum):
-        return basic_type(["int"])
-    assert not isinstance(
-        type, (ArrayDecl, FuncDecl)
-    ), "resolve_typedefs can't hide arrays/functions"
-    return type
-
-
 def type_from_global_decl(decl: ca.Decl) -> CType:
     """Get the CType of a global Decl, stripping names of function parameters."""
     tp = decl.type
@@ -118,7 +131,7 @@ def type_from_global_decl(decl: ca.Decl) -> CType:
         param = copy.deepcopy(param)
         param.name = None
         set_decl_name(param)
-        return ca.Typename(name=None, quals=param.quals, type=param.type)
+        return ca.Typename(name=None, quals=param.quals, type=param.type, align=[])
 
     new_params: List[Union[ca.Decl, ca.ID, ca.Typename, ca.EllipsisParam]] = [
         anonymize_param(param) if isinstance(param, ca.Decl) else param
@@ -127,47 +140,12 @@ def type_from_global_decl(decl: ca.Decl) -> CType:
     return ca.FuncDecl(args=ca.ParamList(new_params), type=tp.type)
 
 
-def deref_type(type: CType, typemap: TypeMap) -> CType:
-    type = resolve_typedefs(type, typemap)
-    assert isinstance(type, (ArrayDecl, PtrDecl)), "dereferencing non-pointer"
-    return type.type
-
-
 def is_void(type: CType) -> bool:
     return (
         isinstance(type, ca.TypeDecl)
         and isinstance(type.type, ca.IdentifierType)
         and type.type.names == ["void"]
     )
-
-
-def equal_types(a: CType, b: CType) -> bool:
-    def equal(a: Any, b: Any) -> bool:
-        if a is b:
-            return True
-        if type(a) != type(b):
-            return False
-        if a is None:
-            return b is None
-        if isinstance(a, list):
-            assert isinstance(b, list)
-            if len(a) != len(b):
-                return False
-            for i in range(len(a)):
-                if not equal(a[i], b[i]):
-                    return False
-            return True
-        if isinstance(a, (int, str)):
-            return bool(a == b)
-        assert isinstance(a, ca.Node)
-        for name in a.__slots__[:-2]:  # type: ignore
-            if name == "declname":
-                continue
-            if not equal(getattr(a, name), getattr(b, name)):
-                return False
-        return True
-
-    return equal(a, b)
 
 
 def primitive_size(type: Union[ca.Enum, ca.IdentifierType]) -> int:
@@ -207,16 +185,44 @@ def function_arg_size_align(type: CType, typemap: TypeMap) -> Tuple[int, int]:
     return size, size
 
 
-def var_size_align(type: CType, typemap: TypeMap) -> Tuple[int, int]:
-    size, align, _ = parse_struct_member(type, "", typemap, allow_unsized=True)
-    return size, align
-
-
 def is_struct_type(type: CType, typemap: TypeMap) -> bool:
     type = resolve_typedefs(type, typemap)
     if not isinstance(type, TypeDecl):
         return False
     return isinstance(type.type, (ca.Struct, ca.Union))
+
+
+def is_unk_type(type: CType, typemap: TypeMap) -> bool:
+    """Return True if `type` represents an unknown type, or undetermined struct padding."""
+    # Check for types matching "char unk_N[...];" or "char padN[...];"
+    if (
+        isinstance(type, ArrayDecl)
+        and isinstance(type.type, TypeDecl)
+        and isinstance(type.type.type, IdentifierType)
+        and type.type.declname is not None
+        and type.type.type.names == ["char"]
+    ):
+        declname = type.type.declname
+        if declname.startswith("unk_") or declname.startswith("pad"):
+            return True
+
+    # Check for types which are typedefs starting with "UNK_" or "MIPS2C_UNK",
+    # or are arrays/pointers to one of these types.
+    while True:
+        if (
+            isinstance(type, TypeDecl)
+            and isinstance(type.type, IdentifierType)
+            and len(type.type.names) == 1
+            and type.type.names[0] in typemap.typedefs
+        ):
+            type_name = type.type.names[0]
+            if type_name.startswith("UNK_") or type_name.startswith("MIPS2C_UNK"):
+                return True
+            type = typemap.typedefs[type_name]
+        elif isinstance(type, (PtrDecl, ArrayDecl)):
+            type = type.type
+        else:
+            return False
 
 
 def get_primitive_list(type: CType, typemap: TypeMap) -> Optional[List[str]]:
@@ -231,7 +237,9 @@ def get_primitive_list(type: CType, typemap: TypeMap) -> Optional[List[str]]:
     return None
 
 
-def parse_function(fn: FuncDecl) -> Function:
+def parse_function(fn: CType) -> Optional[Function]:
+    if not isinstance(fn, FuncDecl):
+        return None
     params: List[Param] = []
     is_variadic = False
     has_void = False
@@ -256,7 +264,9 @@ def parse_function(fn: FuncDecl) -> Function:
         # Function declaration without a parameter list
         maybe_params = None
     ret_type = None if is_void(fn.type) else fn.type
-    return Function(ret_type=ret_type, params=maybe_params, is_variadic=is_variadic)
+    return Function(
+        type=fn, ret_type=ret_type, params=maybe_params, is_variadic=is_variadic
+    )
 
 
 def divmod_towards_zero(lhs: int, rhs: int, op: str) -> int:
@@ -364,9 +374,13 @@ def get_struct(
     struct: Union[ca.Struct, ca.Union], typemap: TypeMap
 ) -> Optional[Struct]:
     if struct.name:
-        return typemap.named_structs.get(struct.name)
+        return typemap.structs.get(struct.name)
     else:
-        return typemap.anon_structs.get(id(struct))
+        return typemap.structs.get(struct)
+
+
+class UndefinedStructError(DecompFailure):
+    pass
 
 
 def parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Struct:
@@ -374,12 +388,13 @@ def parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Struct
     if existing:
         return existing
     if struct.decls is None:
-        raise DecompFailure(f"Tried to use struct {struct.name} before it is defined.")
+        raise UndefinedStructError(
+            f"Tried to use struct {struct.name} before it is defined (does it have a definition?)."
+        )
     ret = do_parse_struct(struct, typemap)
     if struct.name:
-        typemap.named_structs[struct.name] = ret
-    else:
-        typemap.anon_structs[id(struct)] = ret
+        typemap.structs[struct.name] = ret
+    typemap.structs[struct] = ret
     return ret
 
 
@@ -414,22 +429,6 @@ def parse_struct_member(
     return size, size, None
 
 
-def expand_detailed_struct_member(
-    substr: DetailedStructMember, type: CType, size: int
-) -> Iterator[Tuple[int, str, CType, int]]:
-    yield (0, "", type, size)
-    if isinstance(substr, Struct):
-        for off, sfields in substr.fields.items():
-            for field in sfields:
-                yield (off, "." + field.name, field.type, field.size)
-    elif isinstance(substr, Array) and substr.subsize != 1:
-        for i in range(substr.dim):
-            for (off, path, subtype, subsize) in expand_detailed_struct_member(
-                substr.subtype, substr.subctype, substr.subsize
-            ):
-                yield (substr.subsize * i + off, f"[{i}]" + path, subtype, subsize)
-
-
 def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Struct:
     is_union = isinstance(struct, ca.Union)
     assert struct.decls is not None, "enforced by caller"
@@ -440,6 +439,7 @@ def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Str
     align = 1
     offset = 0
     bit_offset = 0
+    has_bitfields = False
     for decl in struct.decls:
         if not isinstance(decl, ca.Decl):
             continue
@@ -455,6 +455,7 @@ def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Str
             #   'type' (lw/lh/lb, unsigned counterparts). If it straddles a 'type'
             #   alignment boundary, skip all bits up to that boundary and then use the
             #   next 'b' bits from there instead.
+            has_bitfields = True
             width = parse_constant_int(decl.bitsize, typemap)
             ssize, salign, substr = parse_struct_member(
                 type, field_name, typemap, allow_unsized=False
@@ -487,12 +488,13 @@ def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Str
             )
             align = max(align, salign)
             offset = (offset + salign - 1) & -salign
-            for off, path, ftype, fsize in expand_detailed_struct_member(
-                substr, type, ssize
-            ):
-                fields[offset + off].append(
-                    StructField(type=ftype, size=fsize, name=decl.name + path)
+            fields[offset].append(
+                StructField(
+                    type=type,
+                    size=ssize,
+                    name=decl.name,
                 )
+            )
             if is_union:
                 union_size = max(union_size, ssize)
             else:
@@ -522,9 +524,19 @@ def do_parse_struct(struct: Union[ca.Struct, ca.Union], typemap: TypeMap) -> Str
         bit_offset = 0
         offset += 1
 
+    # If there is a typedef for this struct, prefer using that name
+    if struct in typemap.struct_typedefs:
+        ctype = typemap.struct_typedefs[struct]
+    elif struct.name and struct.name in typemap.struct_typedefs:
+        ctype = typemap.struct_typedefs[struct.name]
+    else:
+        ctype = TypeDecl(declname=None, quals=[], type=struct, align=[])
+
     size = union_size if is_union else offset
     size = (size + align - 1) & -align
-    return Struct(fields=fields, size=size, align=align)
+    return Struct(
+        type=ctype, fields=fields, has_bitfields=has_bitfields, size=size, align=align
+    )
 
 
 def add_builtin_typedefs(source: str) -> str:
@@ -562,9 +574,40 @@ def strip_comments(text: str) -> str:
     return re.sub(pattern, replacer, text)
 
 
-def parse_c(source: str) -> ca.FileAST:
+def strip_macro_defs(text: str) -> str:
+    """Strip macro definitions from C source. mips_to_c does not run the preprocessor,
+    for a bunch of reasons:
+
+    - we don't know what include directories to use
+    - it avoids a dependency on cpp, which is commonly unavailable on MacOS/Windows
+    - web site security (#includes could read sensitive files)
+    - performance
+
+    Instead that responsibility is passed on to whoever generates the context file.
+
+    But the context file may sometimes still contain macro definitions, if generated
+    with the dual purpose of being used as a real include file that users expect to
+    preserve macros.
+
+    Under the optimistic assumption that the macros aren't necessary for parsing the
+    context file itself, we strip all macro definitions before parsing."""
+    pattern = re.compile(r"^[ \t]*#[ \t]*define[ \t](\\\n|.)*", flags=re.MULTILINE)
+    return re.sub(pattern, lambda m: m.group(0).count("\n") * "\n", text)
+
+
+def parse_c(
+    source: str, initial_scope: CParserScope
+) -> Tuple[ca.FileAST, CParserScope]:
+    # This is a modified version of `CParser.parse()` which initializes `_scope_stack`,
+    # which contains the only stateful part of the parser that needs to be preserved
+    # when parsing multiple files.
+    c_parser = CParser()
+    c_parser.clex.filename = "<source>"
+    c_parser.clex.reset_lineno()
+    c_parser._scope_stack = [initial_scope.copy()]
+    c_parser._last_yielded_token = None
     try:
-        return CParser().parse(source, "<source>")
+        ast = c_parser.cparser.parse(input=source, lexer=c_parser.clex)
     except ParseError as e:
         msg = str(e)
         position, msg = msg.split(": ", 1)
@@ -583,52 +626,112 @@ def parse_c(source: str) -> ca.FileAST:
         else:
             posstr = ""
         raise DecompFailure(f"Syntax error when parsing C context.\n{msg}{posstr}")
+    return ast, c_parser._scope_stack[0].copy()
 
 
-@functools.lru_cache(maxsize=4)
-def build_typemap(source: str) -> TypeMap:
-    source = add_builtin_typedefs(source)
-    source = strip_comments(source)
-    ast: ca.FileAST = parse_c(source)
-    ret = TypeMap()
+def build_typemap(source_paths: List[Path], use_cache: bool) -> TypeMap:
+    # Wrapper to convert `source_paths` into a hashable type
+    return _build_typemap(tuple(source_paths), True)
 
-    for item in ast.ext:
-        if isinstance(item, ca.Typedef):
-            ret.typedefs[item.name] = item.type
-        if isinstance(item, ca.FuncDef):
-            assert item.decl.name is not None, "cannot define anonymous function"
-            assert isinstance(item.decl.type, FuncDecl)
-            ret.functions[item.decl.name] = parse_function(item.decl.type)
-        if isinstance(item, ca.Decl) and isinstance(item.type, FuncDecl):
-            assert item.name is not None, "cannot define anonymous function"
-            ret.functions[item.name] = parse_function(item.type)
 
-    defined_function_decls: Set[ca.Decl] = set()
+@functools.lru_cache(maxsize=16)
+def _build_typemap(source_paths: Tuple[Path, ...], use_cache: bool) -> TypeMap:
+    typemap = TypeMap()
 
-    class Visitor(ca.NodeVisitor):
-        def visit_Struct(self, struct: ca.Struct) -> None:
-            if struct.decls is not None:
-                parse_struct(struct, ret)
+    for source_path in source_paths:
+        source = source_path.read_text(encoding="utf-8-sig")
 
-        def visit_Union(self, union: ca.Union) -> None:
-            if union.decls is not None:
-                parse_struct(union, ret)
+        # Compute a hash of the inputs to the TypeMap, which is used to check if the cached
+        # version is still valid. The hashing process does not need to be cryptographically
+        # secure, caching should only be enabled in trusted environments. (Unpickling files
+        # can lead to arbitrary code execution.)
+        hasher = hashlib.sha256()
+        hasher.update(f"version={TypeMap.VERSION}\n".encode("utf-8"))
+        hasher.update(f"parent={typemap.source_hash}\n".encode("utf-8"))
+        hasher.update(source.encode("utf-8"))
+        source_hash = hasher.hexdigest()
 
-        def visit_Decl(self, decl: ca.Decl) -> None:
-            if decl.name is not None:
-                ret.var_types[decl.name] = type_from_global_decl(decl)
-            if not isinstance(decl.type, FuncDecl):
-                self.visit(decl.type)
+        cache_path = source_path.with_name(f"{source_path.name}.m2c")
+        if use_cache and cache_path.exists():
+            try:
+                with cache_path.open("rb") as f:
+                    cache = cast(TypeMap, pickle.load(f))
+            except Exception as e:
+                print(
+                    f"Warning: Unable to read cache file {cache_path}, skipping ({e})"
+                )
+            else:
+                if cache.source_hash == source_hash:
+                    typemap = cache
+                    continue
 
-        def visit_Enum(self, enum: ca.Enum) -> None:
-            parse_enum(enum, ret)
+        source = add_builtin_typedefs(source)
+        source = strip_comments(source)
+        source = strip_macro_defs(source)
 
-        def visit_FuncDef(self, fn: ca.FuncDef) -> None:
-            if fn.decl.name is not None:
-                ret.var_types[fn.decl.name] = type_from_global_decl(fn.decl)
+        ast, result_scope = parse_c(source, typemap.cparser_scope)
+        typemap.cparser_scope = result_scope
+        typemap.source_hash = source_hash
 
-    Visitor().visit(ast)
-    return ret
+        for item in ast.ext:
+            if isinstance(item, ca.Typedef):
+                typemap.typedefs[item.name] = item.type
+                if isinstance(item.type, TypeDecl) and isinstance(
+                    item.type.type, (ca.Struct, ca.Union)
+                ):
+                    typedef = basic_type([item.name])
+                    if item.type.type.name:
+                        typemap.struct_typedefs[item.type.type.name] = typedef
+                    typemap.struct_typedefs[item.type.type] = typedef
+            if isinstance(item, ca.FuncDef):
+                assert item.decl.name is not None, "cannot define anonymous function"
+                fn = parse_function(item.decl.type)
+                assert fn is not None
+                typemap.functions[item.decl.name] = fn
+            if isinstance(item, ca.Decl) and isinstance(item.type, FuncDecl):
+                assert item.name is not None, "cannot define anonymous function"
+                fn = parse_function(item.type)
+                assert fn is not None
+                typemap.functions[item.name] = fn
+
+        defined_function_decls: Set[ca.Decl] = set()
+
+        class Visitor(ca.NodeVisitor):
+            def visit_Struct(self, struct: ca.Struct) -> None:
+                if struct.decls is not None:
+                    parse_struct(struct, typemap)
+
+            def visit_Union(self, union: ca.Union) -> None:
+                if union.decls is not None:
+                    parse_struct(union, typemap)
+
+            def visit_Decl(self, decl: ca.Decl) -> None:
+                if decl.name is not None:
+                    typemap.var_types[decl.name] = type_from_global_decl(decl)
+                    if decl.init is not None:
+                        typemap.vars_with_initializers.add(decl.name)
+                if not isinstance(decl.type, FuncDecl):
+                    self.visit(decl.type)
+
+            def visit_Enum(self, enum: ca.Enum) -> None:
+                parse_enum(enum, typemap)
+
+            def visit_FuncDef(self, fn: ca.FuncDef) -> None:
+                if fn.decl.name is not None:
+                    typemap.var_types[fn.decl.name] = type_from_global_decl(fn.decl)
+
+        Visitor().visit(ast)
+
+        if use_cache:
+            try:
+                with cache_path.open("wb") as f:
+                    pickle.dump(typemap, f)
+            except Exception as e:
+                print(
+                    f"Warning: Unable to write cache file {cache_path}, skipping ({e})"
+                )
+
+    return typemap
 
 
 def set_decl_name(decl: ca.Decl) -> None:
@@ -639,7 +742,7 @@ def set_decl_name(decl: ca.Decl) -> None:
     type.declname = name
 
 
-def type_to_string(type: CType) -> str:
+def type_to_string(type: CType, name: str = "") -> str:
     if isinstance(type, TypeDecl) and isinstance(
         type.type, (ca.Struct, ca.Union, ca.Enum)
     ):
@@ -652,7 +755,7 @@ def type_to_string(type: CType) -> str:
             return f"{su} {type.type.name}"
         else:
             return f"anon {su}"
-    decl = ca.Decl("", [], [], [], type, None, None)
+    decl = ca.Decl(name, [], [], [], [], copy.deepcopy(type), None, None)
     set_decl_name(decl)
     return to_c(decl)
 
@@ -660,23 +763,17 @@ def type_to_string(type: CType) -> str:
 def dump_typemap(typemap: TypeMap) -> None:
     print("Variables:")
     for var, type in typemap.var_types.items():
-        print(f"{var}:", type_to_string(type))
+        print(f"{type_to_string(type, var)};")
     print()
     print("Functions:")
     for name, fn in typemap.functions.items():
-        if fn.params is None:
-            params_str = ""
-        else:
-            params = [type_to_string(arg.type) for arg in fn.params]
-            if fn.is_variadic:
-                params.append("...")
-            params_str = ", ".join(params) or "void"
-        ret_str = "void" if fn.ret_type is None else type_to_string(fn.ret_type)
-        print(f"{name}: {ret_str}({params_str})")
+        print(f"{type_to_string(fn.type, name)};")
     print()
     print("Structs:")
-    for name, struct in typemap.named_structs.items():
-        print(f"{name}: size {struct.size}, align {struct.align}")
+    for name_or_id, struct in typemap.structs.items():
+        if not isinstance(name_or_id, str):
+            continue
+        print(f"{name_or_id}: size {hex(struct.size)}, align {struct.align}")
         for offset, fields in struct.fields.items():
             print(f"  {hex(offset)}:", end="")
             for field in fields:

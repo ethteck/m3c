@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-import attr
 import contextlib
+from dataclasses import dataclass, field
 import difflib
 import io
 import logging
@@ -18,23 +18,24 @@ from src.options import Options
 CRASH_STRING = "CRASHED\n"
 
 
-@attr.s(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TestOptions:
-    should_overwrite: bool = attr.ib()
-    diff_context: int = attr.ib()
-    filter_re: Pattern[str] = attr.ib()
-    parallel: Optional[int] = attr.ib(default=None)
-    coverage: Any = attr.ib(default=None)
+    should_overwrite: bool
+    diff_context: int
+    filter_re: Pattern[str]
+    parallel: Optional[int] = None
+    extra_flags: List[str] = field(default_factory=list)
+    coverage: Any = None
 
 
-@attr.s(frozen=True, slots=True)
+@dataclass(frozen=True, order=True)
 class TestCase:
-    name: str = attr.ib()
-    asm_file: Path = attr.ib()
-    output_file: Path = attr.ib()
-    brief_crashes: bool = attr.ib(default=True)
-    flags_path: Optional[Path] = attr.ib(default=None)
-    flags: List[str] = attr.ib(factory=list)
+    name: str
+    asm_file: Path
+    output_file: Path
+    brief_crashes: bool = True
+    flags_path: Optional[Path] = None
+    flags: List[str] = field(default_factory=list)
 
 
 def set_up_logging(debug: bool) -> None:
@@ -50,15 +51,17 @@ def get_test_flags(flags_path: Path) -> List[str]:
 
     flags_str = flags_path.read_text()
     flags_list = shlex.split(flags_str)
-    try:
-        context_index = flags_list.index("--context")
-        relative_context_path: str = flags_list[context_index + 1]
+    for i, flag in enumerate(flags_list):
+        if flag != "--context":
+            continue
+        try:
+            relative_context_path: str = flags_list[i + 1]
+        except IndexError:
+            raise Exception(
+                f"{flags_path} contains --context without argument"
+            ) from None
         absolute_context_path: Path = flags_path.parent / relative_context_path
-        flags_list[context_index + 1] = str(absolute_context_path)
-    except ValueError:
-        pass  # doesn't have --context flag
-    except IndexError:
-        raise Exception(f"{flags_path} contains --context without argument") from None
+        flags_list[i + 1] = str(absolute_context_path)
 
     return flags_list
 
@@ -81,10 +84,12 @@ def decompile_and_compare(
             return None, f"{test_case.output_file} does not exist. Skippping."
         original_contents = "(file did not exist)"
 
-    test_flags = ["--sanitize-tracebacks", "--stop-on-error", str(test_case.asm_file)]
+    test_flags = ["--sanitize-tracebacks", "--stop-on-error"]
     test_flags.extend(test_case.flags)
     if test_case.flags_path is not None:
         test_flags.extend(get_test_flags(test_case.flags_path))
+    test_flags.append(str(test_case.asm_file))
+    test_flags.extend(test_options.extra_flags)
     options = parse_flags(test_flags)
 
     final_contents = decompile_and_capture_output(options, test_case.brief_crashes)
@@ -145,10 +150,64 @@ def create_e2e_tests(
                 output_file=output_file,
                 brief_crashes=True,
                 flags_path=flags_path,
-                flags=["test"],  # Decompile the function 'test'
+                flags=["--function", "test"],
             )
         )
+    cases.sort()
     return cases
+
+
+def find_tests_basic(asm_dir: Path) -> Iterator[List[Path]]:
+    # This has been tested with doldecomp projects for SMS, Melee, and SMB1
+    for asm_file in asm_dir.rglob("*.s"):
+        yield [asm_file]
+
+
+def find_tests_oot(asm_dir: Path) -> Iterator[List[Path]]:
+    rodata_suffixes = [".rodata.s", ".rodata2.s"]
+    for asm_file in asm_dir.rglob("*.s"):
+        # Skip .rodata files
+        asm_name = asm_file.name
+        if any(asm_name.endswith(s) for s in rodata_suffixes):
+            continue
+        path_list = [asm_file]
+
+        # Check for .rodata in the same directory
+        for suffix in rodata_suffixes:
+            path = asm_file.parent / asm_name.replace(".s", suffix)
+            if path.exists():
+                path_list.append(path)
+
+        yield path_list
+
+
+def find_tests_mm(asm_dir: Path) -> Iterator[List[Path]]:
+    for asm_file in asm_dir.rglob("*.text.s"):
+        path_list = [asm_file]
+
+        # Find .data/.rodata/.bss files in their data directory
+        data_path = Path(
+            str(asm_file).replace("/asm/overlays/", "/data/").replace("/asm/", "/data/")
+        ).parent
+        for f in data_path.glob("*.s"):
+            path_list.append(f)
+
+        yield path_list
+
+
+def find_tests_splat(asm_dir: Path) -> Iterator[List[Path]]:
+    # This has only been tested with Paper Mario, but should work with other splat projects
+    for asm_file in (asm_dir / "nonmatchings").rglob("*.s"):
+        path_list = [asm_file]
+
+        # Find .data/.rodata/.bss files in their data directory
+        data_path = Path(
+            str(asm_file).replace("/nonmatchings/", "/data/")
+        ).parent.parent
+        for f in data_path.glob("*.s"):
+            path_list.append(f)
+
+        yield path_list
 
 
 def create_project_tests(
@@ -159,62 +218,51 @@ def create_project_tests(
 ) -> List[TestCase]:
     cases: List[TestCase] = []
     asm_dir = base_dir / "asm"
-    for asm_file in asm_dir.rglob("*"):
-        if asm_file.suffix not in (".asm", ".s"):
+    if "oot" in base_dir.parts:
+        file_iter = find_tests_oot(asm_dir)
+        base_flags = ["--compiler=ido", "--stack-structs", "--unk-underscore"]
+    elif "mm" in base_dir.parts:
+        file_iter = find_tests_mm(asm_dir)
+        base_flags = ["--compiler=ido", "--stack-structs", "--unk-underscore"]
+    elif "papermario" in base_dir.parts:
+        file_iter = find_tests_splat(asm_dir)
+        base_flags = [
+            "--compiler=gcc",
+            "--stack-structs",
+            "--unk-underscore",
+            "--pointer-style=left",
+        ]
+    else:
+        file_iter = find_tests_basic(asm_dir)
+        base_flags = [
+            "--incbin-dir",
+            str(base_dir),
+            "--stack-structs",
+            "--unk-underscore",
+        ]
+
+    for file_list in file_iter:
+        if not file_list:
             continue
 
-        asm_name = asm_file.name
-        if (
-            asm_name.startswith("code_data")
-            or asm_name.startswith("code_rodata")
-            or asm_name.startswith("boot_data")
-            or asm_name.startswith("boot_rodata")
-            or asm_name.endswith("_data.asm")
-            or asm_name.endswith("_rodata.asm")
-            or asm_name.endswith(".data.s")
-            or asm_name.endswith(".rodata.s")
-            or asm_name.endswith(".rodata2.s")
-        ):
-            continue
-
-        flags = []
+        flags = base_flags[:]
         if context_file is not None:
             flags.extend(["--context", str(context_file)])
 
-        # Guess the name of .rodata file(s) for the MM decomp project
-        for candidate in [
-            # mm code/*.asm
-            "code_rodata_" + asm_name,
-            asm_name.replace("code_", "code_rodata_"),
-            # mm boot/*.asm
-            "boot_rodata_" + asm_name,
-            asm_name.replace("boot_", "boot_rodata_"),
-            # mm overlays/*.asm
-            asm_name.rpartition("_0x")[0] + "_rodata.asm",
-            asm_name.rpartition("_0x")[0] + "_late_rodata.asm",
-            # oot *.s
-            asm_name.replace(".s", ".rodata.s"),
-            asm_name.replace(".s", ".rodata2.s"),
-        ]:
-            if candidate == asm_name:
-                continue
-            f = asm_file.parent / candidate
-            if f.exists():
-                flags.extend(["--rodata", str(f)])
-
-        test_path = asm_file.relative_to(asm_dir)
+        test_path = file_list[0].relative_to(base_dir / "asm")
         name = f"{name_prefix}:{test_path}"
         output_file = (output_dir / test_path).with_suffix(".c")
 
         cases.append(
             TestCase(
                 name=name,
-                asm_file=asm_file,
+                asm_file=file_list[0],
                 output_file=output_file,
                 brief_crashes=False,
-                flags=flags,
+                flags=flags + [str(p) for p in file_list[1:]],
             )
         )
+    cases.sort()
     return cases
 
 
@@ -303,7 +351,7 @@ def main(
         f"Test summary: {passed} passed, {skipped} skipped, {failed} failed, {passed + skipped + failed} total"
     )
 
-    if failed > 0 and test_options.should_overwrite:
+    if failed > 0 and not test_options.should_overwrite:
         return 1
     return 0
 
@@ -361,6 +409,11 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "extra_flags",
+        nargs=argparse.REMAINDER,
+        help="Additional arguments to pass to mips_to_c. Use `--` to separate them from run_tests's flags.",
+    )
+    parser.add_argument(
         "--project-with-context",
         metavar="DIR",
         dest="project_dirs",
@@ -409,11 +462,15 @@ if __name__ == "__main__":
     if args.should_overwrite:
         logging.info("Overwriting test output files.")
 
+    if "--" in args.extra_flags:
+        args.extra_flags.remove("--")
+
     test_options = TestOptions(
         should_overwrite=args.should_overwrite,
         diff_context=args.diff_context,
         filter_re=args.filter_re,
         parallel=args.parallel,
+        extra_flags=args.extra_flags,
         coverage=cov,
     )
     ret = main(args.project_dirs, test_options)

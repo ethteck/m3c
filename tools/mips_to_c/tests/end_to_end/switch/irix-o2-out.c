@@ -1,28 +1,32 @@
+extern s32 D_410150;
+
 s32 test(s32 arg0) {
-    u32 temp_t6;
     s32 phi_a0;
     s32 phi_a0_2;
 
-    temp_t6 = arg0 - 1;
-    if (temp_t6 < 7U) {
-        phi_a0_2 = arg0;
-        goto **(&jpt_400130 + (temp_t6 * 4));
-    case 0:
+    phi_a0_2 = arg0;
+    switch (arg0) {
+    case 0x1:
         return arg0 * arg0;
-    case 1:
+    case 0x2:
         phi_a0_2 = arg0 - 1;
-    case 2:
+        /* fallthrough */
+    case 0x3:
         return phi_a0_2 * 2;
-    case 3:
+    case 0x4:
         phi_a0 = arg0 + 1;
-        goto block_8;
-    default:
+        D_410150 = phi_a0;
+        return 2;
+    case 0x6:
+    case 0x7:
         phi_a0 = arg0 * 2;
-    } else {
-    case 4:
+        /* Duplicate return node #8. Try simplifying control flow for better match */
+        D_410150 = phi_a0;
+        return 2;
+    default:
         phi_a0 = arg0 / 2;
+        /* Duplicate return node #8. Try simplifying control flow for better match */
+        D_410150 = phi_a0;
+        return 2;
     }
-block_8:
-    D_410150 = phi_a0;
-    return 2;
 }
