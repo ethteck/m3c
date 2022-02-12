@@ -72,6 +72,8 @@ def handle_func(func_match, c_path, c_text):
         print(f"mips_to_c failed on {func_name}")
         return c_text
     
+    m2c_out = m2c_out.replace("?", "s32")
+
     new_c_text = c_text[:func_match.span(0)[0]] + m2c_out + c_text[func_match.span(0)[1]:]
     
     with open(c_path, "w", newline="\n") as f:
@@ -88,6 +90,7 @@ def handle_func(func_match, c_path, c_text):
             with open(c_path, "w", newline="\n") as f:
                 f.write(c_text)
         else:
+            print(f"Build failed on {func_name}")
             with open(c_path, "w", newline="\n") as f:
                 f.write(c_text)
         return c_text
